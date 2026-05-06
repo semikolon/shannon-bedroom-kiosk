@@ -1,0 +1,40 @@
+[package]
+name = "shannon-kiosk"
+version = "0.1.0"
+edition = "2021"
+description = "Bedroom Shannon kiosk UI — retro-themed, Xbox-controller-driven menu"
+authors = ["Fredrik Branstrom"]
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+# Bevy: game-engine for the retro-themed UI.
+# default-features = true gives gamepad support (bevy_gilrs), text rendering,
+# windowing (winit), 2D rendering, asset loading. Trim later if too heavy.
+bevy = { version = "0.14", default-features = false, features = [
+    "animation",
+    "bevy_asset",
+    "bevy_color",
+    "bevy_core_pipeline",
+    "bevy_gilrs",         # gamepad input — first-class Xbox controller
+    "bevy_render",
+    "bevy_sprite",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_winit",
+    "default_font",       # built-in font so we boot before a custom font is loaded
+    "x11",                # X11 backend (Xwayland fallback under cage)
+    "wayland",            # native Wayland (cage compositor)
+    "tonemapping_luts",
+    "webgl2",
+] }
+
+# Performance profile for release — Bevy is heavy without optimizations
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Dev: enable optimizations on dependencies (Bevy is too slow in pure debug)
+[profile.dev.package."*"]
+opt-level = 3
