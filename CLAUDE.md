@@ -48,11 +48,23 @@ ssh shannon 'shannon-mode set blank; systemctl stop shannon-display.service; syn
 
 ## Critical constraints (derived from Phase 1 power-cycles)
 
-1. **`WinitSettings::desktop_app()` is mandatory**, not optional. Default Bevy continuous render loop on lavapipe (CPU software Vulkan) pegs all 6 cores → kernel softlockup. Reactive update mode (event-driven) is the canonical Shannon path.
-2. **Don't enable HW Vulkan via panvk** on Mali T860. The panfrost ICD is renamed to `.disabled-mali-t860-panvk-stall` deliberately. Mode script forces lavapipe via `VK_ICD_FILENAMES`. Re-enable when Mesa fixes T860 panvk (track Mesa changelogs for Mali Midgard panvk improvements; see `dotfiles/system/shannon/README.md` § "GPU stack on Shannon" for the table).
-3. **Always `sync`** after any `scp` / `ssh shannon "cat > ..."` / `shannon-mode set` — see `dotfiles/system/shannon/README.md` § "Workload policy".
+1. **`WinitSettings::desktop_app()` is mandatory** under lavapipe (CPU software Vulkan), not optional. Default Bevy continuous render loop on lavapipe pegs all 6 cores → kernel softlockup. Reactive update mode (event-driven) is the canonical Shannon path. **Once HW-GLES path is working (see § "Next move" below), reactive mode becomes optional but still recommended for power efficiency.**
+2. **Don't enable HW Vulkan via panvk** on Mali T860. The panfrost ICD is renamed to `.disabled-mali-t860-panvk-stall` permanently. **Midgard panvk was deliberately removed from Mesa upstream in 2022** and will not return. Do NOT unrename, do NOT retest. See `~/dotfiles/system/shannon/README.md` § "GPU stack on Shannon".
+3. **Always `sync`** after any `scp` / `ssh shannon "cat > ..."` / `shannon-mode set` — see `~/dotfiles/system/shannon/README.md` § "Workload policy".
 4. **Watchdog won't auto-recover most freezes** — pid1 keeps petting `/dev/watchdog0` even when userspace is wedged. Always pull-and-replug Shannon's USB-C power.
 5. **NEVER add the kiosk to systemd auto-start** until stable for many days. Currently `shannon-display.service` is `disabled` deliberately — boot to console, kiosk only via explicit `shannon-mode now`. This makes power-cycle recovery from a bad kiosk change graceful.
+
+## Next move (queued for next session)
+
+**Vendor-patch wgpu-hal 0.21.1 with wgpu PR #9153 backport** to unlock HW-accelerated GLES on the actual Mali T860 GPU via Mesa Panfrost. Root cause + fix path fully diagnosed in `~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md` § A. Steps:
+
+1. Clone `gfx-rs/wgpu` at tag `wgpu-v0.20.0`, extract `wgpu-hal/src/gles/egl.rs`
+2. Apply minimal retry-loop patch (~100 lines) backporting PRs #7952 + #9153 to add `BadAttribute | BadMatch | BadConfig` retry on `eglCreateContext`
+3. Add `[patch.crates-io] wgpu-hal = { path = "vendored/wgpu-hal-0.21.1-mali-fix" }` to project's `Cargo.toml`
+4. Update mode script `~/dotfiles/system/shannon/etc/shannon-modes/shannon-kiosk.sh`: drop `VK_ICD_FILENAMES`, add `WGPU_BACKEND=gl`
+5. Cross-build, deploy, observe HW acceleration via `panfrost_dri.so`
+
+**Pre-deploy gate** (per cycle 4 freeze analysis): instrument Shannon first (pstore via ramoops, heartbeat enrichment with `/proc/interrupts mmc/usb`, `/proc/diskstats`, `vmstat`, D-state task list) AND run HA-only baseline 24-48h. Don't deploy a new kiosk binary into an under-instrumented environment. Detail: research doc § D + § E.
 
 ## Cross-references
 
