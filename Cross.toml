@@ -1,0 +1,26 @@
+# Cross-compile config for shannon-kiosk (Bevy 0.14 → aarch64-unknown-linux-gnu).
+#
+# WHY :edge image: same reason as spotifyd build (Trixie ships libssl3,
+# default :main image is Ubuntu 16.04-era libssl1.0). See
+# `~/dotfiles/scripts/shannon-setup/35-spotifyd-cross-install.sh` § :edge.
+#
+# WHY this specific arm64 dev-lib set:
+#   - libudev-dev:arm64       → gilrs (bevy_gilrs gamepad input enumeration). HARD requirement.
+#   - libwayland-dev:arm64    → bevy_winit "wayland" feature (cage compositor is Wayland-native).
+#   - libxkbcommon-dev:arm64  → keyboard input on both Wayland and X11.
+#   - libx11/xcb/xcursor/xi/xrandr/xinerama-dev:arm64
+#                              → bevy_winit "x11" feature (Xwayland fallback under cage).
+#   - libasound2-dev:arm64    → defensive; some Bevy transitive deps probe ALSA at build.
+#   - libssl-dev:arm64        → defensive (curl-sys/native-tls in the dependency tree).
+#   - pkg-config              → cross-arch pkg-config lookups via PKG_CONFIG_ALLOW_CROSS=1.
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:edge"
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update",
+    "apt-get install -y libudev-dev:arm64 libwayland-dev:arm64 libxkbcommon-dev:arm64 libx11-dev:arm64 libxcb1-dev:arm64 libxcursor-dev:arm64 libxi-dev:arm64 libxrandr-dev:arm64 libxinerama-dev:arm64 libasound2-dev:arm64 libssl-dev:arm64 pkg-config",
+]
+
+[build.env]
+passthrough = ["PKG_CONFIG_ALLOW_CROSS"]

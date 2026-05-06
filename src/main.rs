@@ -17,9 +17,19 @@
 
 use bevy::prelude::*;
 use bevy::input::gamepad::{GamepadAxisChangedEvent, GamepadButtonChangedEvent};
+use bevy::winit::WinitSettings;
 
 fn main() {
     App::new()
+        // Reactive update mode: Bevy only renders frames in response to input
+        // events (gamepad, keyboard, window resize), not continuously at 60fps.
+        // CRITICAL on Shannon — lavapipe (CPU software Vulkan) renders take
+        // ~hundreds of ms each on RK3399 hexa-core; uncapped continuous render
+        // pegs all 6 cores → kernel softlockup. May 6, 2026 forced this:
+        // 12s detached probe survived (timeout SIGTERM'd it), but service-mode
+        // continuous render froze the host within ~10s. With desktop_app()
+        // settings, idle CPU drops near-zero; only re-renders on real input.
+        .insert_resource(WinitSettings::desktop_app())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Shannon".to_string(),
