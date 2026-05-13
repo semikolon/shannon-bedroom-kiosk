@@ -527,7 +527,27 @@ impl Inner {
 
         let (config, supports_native_window) = choose_config(&egl, display, srgb_kind)?;
 
-        let supports_opengl = if version >= (1, 4) {
+        // wgpu's GLES backend normally prefers desktop OpenGL when EGL
+        // advertises it (because desktop GL has more features). On Mali
+        // T860 (Midgard) + Mesa Panfrost, the desktop GL path has two
+        // separate problems: (a) version caps at 3.1 (below wgpu's 3.3
+        // requirement), (b) `eglMakeCurrent` on a surfaceless context
+        // bound to an OpenGL_API context returns EGL_BAD_DISPLAY. Both
+        // are avoided by using the OpenGL_ES_API path — Mesa Panfrost
+        // GLES 3.0+ is solid and meets wgpu's GLES-backend minimum.
+        //
+        // The `WGPU_GL_PREFER_GLES` env var lets the application opt
+        // into the GLES path explicitly. We could in principle detect
+        // Mali at runtime, but querying the renderer requires already
+        // having a context — chicken-and-egg. An explicit env-var opt-in
+        // is the smallest workable knob.
+        //
+        // Part of the mali-fix patch (May 13, 2026) — see
+        // ~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md § A.
+        let force_gles = std::env::var_os("WGPU_GL_PREFER_GLES").is_some();
+        let supports_opengl = if force_gles {
+            false
+        } else if version >= (1, 4) {
             let client_apis = egl
                 .query_string(Some(display), khronos_egl::CLIENT_APIS)
                 .unwrap()
@@ -839,7 +859,23 @@ impl crate::Instance for Instance {
             client_ext_str.split_whitespace().collect::<Vec<_>>()
         );
 
-        let wayland_library = if client_ext_str.contains("EGL_EXT_platform_wayland") {
+        // ---- mali-fix patch (May 13, 2026) ----
+        // Honor EGL_PLATFORM=x11 env var as a hard veto on Wayland EGL
+        // platform selection. Default upstream behavior is to prefer
+        // Wayland whenever wl_display_connect(NULL) succeeds, which
+        // happens even with WAYLAND_DISPLAY unset because the Wayland
+        // library falls through to the default "wayland-0" socket in
+        // $XDG_RUNTIME_DIR. On Mali T860 we want X11 EGL to match the
+        // X11 window winit emits (kiosk built without "wayland"
+        // feature) — otherwise wgpu-hal's surface-creation rejects the
+        // Xlib window with "Initialized platform Wayland doesn't work
+        // with window Xlib".
+        let force_egl_x11 = std::env::var_os("EGL_PLATFORM")
+            .map(|v| v == "x11")
+            .unwrap_or(false);
+        let wayland_library = if !force_egl_x11
+            && client_ext_str.contains("EGL_EXT_platform_wayland")
+        {
             test_wayland_display()
         } else {
             None
@@ -1013,6 +1049,16 @@ impl crate::Instance for Instance {
                      * display, we must re-initialize the context.
                      *
                      * See gfx-rs/gfx#3545
+                     *
+                     * NOTE (mali-fix May 13, 2026): this branch has a known bug
+                     * on Mali T860 + Mesa Panfrost — old_inner.drop() terminates
+                     * the EGL display that AdapterContext holds a cloned
+                     * reference to, causing subsequent eglMakeCurrent calls to
+                     * return BAD_DISPLAY and panic at egl.rs:296. Workaround
+                     * for the kiosk: build Bevy WITHOUT the "wayland" feature
+                     * so winit falls back to X11 via Xwayland, which hits the
+                     * empty Xlib/Xcb branch above (no re-init). See
+                     * shannon-bedroom-kiosk Cargo.toml.
                      */
                     log::warn!("Re-initializing Gles context due to Wayland window");
 

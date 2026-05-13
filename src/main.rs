@@ -17,20 +17,53 @@
 
 use bevy::prelude::*;
 use bevy::input::gamepad::{GamepadAxisChangedEvent, GamepadButtonChangedEvent};
+use bevy::render::RenderPlugin;
+use bevy::render::settings::{Backends, WgpuLimits, WgpuSettings, WgpuSettingsPriority};
 use bevy::winit::WinitSettings;
 
 fn main() {
     App::new()
         // Reactive update mode: Bevy only renders frames in response to input
         // events (gamepad, keyboard, window resize), not continuously at 60fps.
-        // CRITICAL on Shannon — lavapipe (CPU software Vulkan) renders take
-        // ~hundreds of ms each on RK3399 hexa-core; uncapped continuous render
-        // pegs all 6 cores → kernel softlockup. May 6, 2026 forced this:
-        // 12s detached probe survived (timeout SIGTERM'd it), but service-mode
-        // continuous render froze the host within ~10s. With desktop_app()
-        // settings, idle CPU drops near-zero; only re-renders on real input.
+        // CRITICAL on Shannon under lavapipe (CPU software Vulkan) — renders
+        // take ~hundreds of ms each on RK3399 hexa-core; uncapped continuous
+        // render pegs all 6 cores → kernel softlockup. Still recommended on
+        // HW-GLES (Mali T860 + Panfrost) for power efficiency.
         .insert_resource(WinitSettings::desktop_app())
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
+        .add_plugins(DefaultPlugins.set(RenderPlugin {
+            // HW-GLES via Mesa Panfrost on Mali T860 (Midgard 4th gen).
+            // The hardware exposes OpenGL ES 3.1 (Mesa 25.0.7 driver_info
+            // reports "OpenGL ES 3.1 Mesa 25.0.7-2"). wgpu's default
+            // `Functionality` priority would require feature flags like
+            // VERTEX_STORAGE (SSBO in vertex shaders) which Panfrost on
+            // Midgard doesn't support — Bevy's `mesh2d_layout` for
+            // example needs it. `WebGL2` priority caps wgpu's required
+            // feature set to the WebGL2 / GLES 3.0 downlevel subset which
+            // Panfrost-on-T860 satisfies fully. Backend pinned to GL so
+            // we don't accidentally try Vulkan (Mali panvk is permanently
+            // dead — see shannon-kiosk.sh comments).
+            //
+            // On Mac Mini Metal, Backends::GL would force GL on macOS too
+            // which is unsupported. So we let backends=All on macOS via
+            // the cfg below, only constraining on Linux (the Shannon
+            // path).
+            render_creation: WgpuSettings {
+                priority: WgpuSettingsPriority::WebGL2,
+                // Set limits EXPLICITLY rather than relying on priority alone
+                // — Bevy 0.14's RenderPlugin merges its own additions on top
+                // of the priority-derived limits, which bumps things like
+                // max_compute_workgroup_size_y back up to 256, exceeding
+                // Panfrost-on-Midgard's 128 cap. Pinning limits to
+                // `downlevel_webgl2_defaults()` (compute=0 across the board)
+                // matches WebGL2's no-compute-shader profile and stays
+                // within Panfrost capabilities.
+                limits: WgpuLimits::downlevel_webgl2_defaults(),
+                #[cfg(target_os = "linux")]
+                backends: Some(Backends::GL),
+                ..default()
+            }.into(),
+            ..default()
+        }).set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Shannon".to_string(),
                 resolution: (1280., 720.).into(),

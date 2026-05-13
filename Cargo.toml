@@ -22,8 +22,19 @@ bevy = { version = "0.14", default-features = false, features = [
     "bevy_ui",
     "bevy_winit",
     "default_font",       # built-in font so we boot before a custom font is loaded
-    "x11",                # X11 backend (Xwayland fallback under cage)
-    "wayland",            # native Wayland (cage compositor)
+    "x11",                # X11 backend via Xwayland under cage — REQUIRED on
+                          # Shannon (Mali T860 + Mesa Panfrost). Cannot use
+                          # native Wayland here: wgpu-hal's create_surface
+                          # re-inits the EGL context for Wayland windows
+                          # (gfx-rs/gfx#3545), which terminates the display
+                          # that AdapterContext holds a cloned reference to,
+                          # then panics with BAD_DISPLAY at egl.rs:296.
+                          # See vendored/wgpu-hal-0.21.1-mali-fix/src/gles/
+                          # egl.rs ~line 1025 for the broken upstream branch.
+                          # X11/Xwayland path hits the empty Xlib/Xcb branch
+                          # in the same function and works cleanly.
+    # "wayland",          # DISABLED — see x11 note above. Mac Mini dev runs
+                          # under macOS (Metal backend), not affected.
     "tonemapping_luts",
     "webgl2",
 ] }
