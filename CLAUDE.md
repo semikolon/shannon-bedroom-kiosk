@@ -54,7 +54,10 @@ ssh shannon 'shannon-mode set blank; systemctl stop shannon-display.service; syn
 4. **Watchdog won't auto-recover most freezes** — pid1 keeps petting `/dev/watchdog0` even when userspace is wedged. Always pull-and-replug Shannon's USB-C power.
 5. **NEVER add the kiosk to systemd auto-start** until stable for many days. Currently `shannon-display.service` is `disabled` deliberately — boot to console, kiosk only via explicit `shannon-mode now`. This makes power-cycle recovery from a bad kiosk change graceful.
 
-## Status (May 13, 2026 — evening)
+## Status (May 13-14, 2026 — evening)
+
+**User direction on GPU stability tradeoffs** (May 13, 2026, verbatim — load-bearing for any future "should we accept software rendering?" temptation): *"I want you to keep working to get GPU support working. I do not want you to revert to software rendering. It's too slow. I want GPU acceleration working."* Lavapipe (CPU software Vulkan) is the documented Phase 1 fallback but is NOT acceptable as a long-term answer. The mitigation strategies in research doc § G2 are ordered around finding a stable HW-GPU path, not accepting a software-render answer.
+
 
 ### ✅ HW-GLES path UNLOCKED end-to-end through wgpu/Bevy stack
 
