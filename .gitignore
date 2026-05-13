@@ -2,3 +2,6 @@
 **/*.rs.bk
 *.profraw
 .DS_Store
+
+# Vendored-crate downloads — commit the unpacked tree, not the tarball
+vendored/*.crate

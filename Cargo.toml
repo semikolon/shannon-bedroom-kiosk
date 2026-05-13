@@ -38,3 +38,16 @@ strip = true
 # Dev: enable optimizations on dependencies (Bevy is too slow in pure debug)
 [profile.dev.package."*"]
 opt-level = 3
+
+# Vendor-patch wgpu-hal 0.21.1 with retry-loop fallback on robustness
+# context creation (backport of upstream wgpu PRs #7952 + #9153). Unlocks
+# HW-accelerated GLES on Mali Midgard (Panfrost arch 5) — required for
+# Shannon's RK3399 Mali T860 GPU. The patch is conditionally compiled in
+# the GLES path (egl.rs is only built on Unix-with-GL), so Mac Mini
+# native Metal builds are unaffected.
+#
+# Full diagnosis: ~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md
+# Patch lives at: vendored/wgpu-hal-0.21.1-mali-fix/src/gles/egl.rs (search
+# "BEGIN mali-fix patch" inside the file).
+[patch.crates-io]
+wgpu-hal = { path = "vendored/wgpu-hal-0.21.1-mali-fix" }

@@ -54,17 +54,43 @@ ssh shannon 'shannon-mode set blank; systemctl stop shannon-display.service; syn
 4. **Watchdog won't auto-recover most freezes** — pid1 keeps petting `/dev/watchdog0` even when userspace is wedged. Always pull-and-replug Shannon's USB-C power.
 5. **NEVER add the kiosk to systemd auto-start** until stable for many days. Currently `shannon-display.service` is `disabled` deliberately — boot to console, kiosk only via explicit `shannon-mode now`. This makes power-cycle recovery from a bad kiosk change graceful.
 
-## Next move (queued for next session)
+## Status of major pre-Phase-2 unlocks (May 13, 2026)
 
-**Vendor-patch wgpu-hal 0.21.1 with wgpu PR #9153 backport** to unlock HW-accelerated GLES on the actual Mali T860 GPU via Mesa Panfrost. Root cause + fix path fully diagnosed in `~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md` § A. Steps:
+### ✅ wgpu-hal Mali T860 HW-GLES patch — BUILT (not deployed)
 
-1. Clone `gfx-rs/wgpu` at tag `wgpu-v0.20.0`, extract `wgpu-hal/src/gles/egl.rs`
-2. Apply minimal retry-loop patch (~100 lines) backporting PRs #7952 + #9153 to add `BadAttribute | BadMatch | BadConfig` retry on `eglCreateContext`
-3. Add `[patch.crates-io] wgpu-hal = { path = "vendored/wgpu-hal-0.21.1-mali-fix" }` to project's `Cargo.toml`
-4. Update mode script `~/dotfiles/system/shannon/etc/shannon-modes/shannon-kiosk.sh`: drop `VK_ICD_FILENAMES`, add `WGPU_BACKEND=gl`
-5. Cross-build, deploy, observe HW acceleration via `panfrost_dri.so`
+Vendored at `vendored/wgpu-hal-0.21.1-mali-fix/` with the retry-loop backport of upstream PRs #7952 + #9153 applied to `src/gles/egl.rs:548-613` (search `BEGIN mali-fix patch` in the file). Root `Cargo.toml` has `[patch.crates-io] wgpu-hal = { path = ... }`. Cross-build verified on Darwin: `2m 23s` clean, 0 errors, 147 routine wgpu-hal warnings (typical for the upstream code on this backend combo). Output binary at `darwin:~/shannon-kiosk-build/shannon-bedroom-kiosk/target/aarch64-unknown-linux-gnu/release/shannon-kiosk`.
 
-**Pre-deploy gate** (per cycle 4 freeze analysis): instrument Shannon first (pstore via ramoops, heartbeat enrichment with `/proc/interrupts mmc/usb`, `/proc/diskstats`, `vmstat`, D-state task list) AND run HA-only baseline 24-48h. Don't deploy a new kiosk binary into an under-instrumented environment. Detail: research doc § D + § E.
+**Patch port specifics**: v0.21.1's `egl.rs` calls `egl.bind_api(...)` once at function entry rather than per-attempt, so we didn't need #9153's closure pattern. The patch just wraps the existing `create_context` call in a retry loop with Core→Ext→None robustness degradation on `BadAttribute | BadMatch | BadConfig` errors. ~100 lines net.
+
+**Deploy preconditions** (still gating — DO NOT push the new binary to Shannon yet):
+1. Shannon instrumentation items 4 + 5 fully landed (see § E in research doc)
+2. HA-only baseline observation period 24-48h (kiosk MODE=blank, eliminates kiosk-induced freezes from the picture)
+3. Mode script change: `~/dotfiles/system/shannon/etc/shannon-modes/shannon-kiosk.sh` needs `VK_ICD_FILENAMES` removed AND `WGPU_BACKEND=gl` added (NOT done yet — keeps lavapipe still active as a revert path)
+
+When all three are met, deploy via the standard pattern:
+```bash
+ssh darwin 'cat ~/shannon-kiosk-build/shannon-bedroom-kiosk/target/aarch64-unknown-linux-gnu/release/shannon-kiosk' \
+  | ssh shannon 'cat > /usr/local/bin/shannon-kiosk && chmod +x /usr/local/bin/shannon-kiosk && sync'
+ssh shannon 'shannon-mode now shannon-kiosk; sync'
+```
+Then verify HW acceleration is actually used (Mesa env: `MESA_DEBUG=1 EGL_LOG_LEVEL=debug` should show `panfrost_dri.so` loaded; GPU frame timing in Bevy diagnostics should drop ~5-10× vs lavapipe).
+
+### 🟨 Shannon instrumentation items 4 + 5 — STAGED (item 5 ready, item 4 awaiting address pick)
+
+Item 5 (userspace canary watchdog) ready to deploy via `hemma system-apply shannon`. Will trigger interactive prompt; user runs manually.
+
+Item 4 (pstore + ramoops) script + systemd unit staged + harmless (inert without ramoops backing). Kernel-cmdline edit deferred — research doc's proposed `0xff000000` is RK3399 SoC MMIO, NOT DRAM. See research doc § E item 4 "Address conflict finding" for the corrected analysis and three options (`memmap=1M$0x70000000` is the most likely candidate; needs user nod before editing `/boot/armbianEnv.txt`).
+
+### 🟨 HA-only baseline 24-48h — pending
+
+Clock has been reset twice today by planned Vattenfall power outages (06:30-08:30 + 14:30-16:30). Restart the baseline window after item 5 lands.
+
+## Next-session focus (Phase 2)
+
+Retro UI shell: pixel-font + main-menu navigation IA + Xbox-controller input mapping + CRT shader (post-processing pass over Bevy's default 2D pipeline). Outstanding decisions:
+- Palette: amber-on-black (CRT-monitor era) vs green-on-black (terminal era) vs full-color retro-game palette
+- Pixel font: Press Start 2P (the default candidate per research doc) vs an actual NES/SNES bitmap font ripped from a public-domain font pack
+- Menu structure: flat (games / movies / lights / quit) vs nested (Games > NES > ...) — first cut is flat for simplicity
 
 ## Cross-references
 
