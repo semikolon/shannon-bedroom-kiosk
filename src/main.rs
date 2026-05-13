@@ -49,15 +49,23 @@ fn main() {
             // path).
             render_creation: WgpuSettings {
                 priority: WgpuSettingsPriority::WebGL2,
-                // Set limits EXPLICITLY rather than relying on priority alone
-                // — Bevy 0.14's RenderPlugin merges its own additions on top
-                // of the priority-derived limits, which bumps things like
-                // max_compute_workgroup_size_y back up to 256, exceeding
-                // Panfrost-on-Midgard's 128 cap. Pinning limits to
-                // `downlevel_webgl2_defaults()` (compute=0 across the board)
-                // matches WebGL2's no-compute-shader profile and stays
-                // within Panfrost capabilities.
-                limits: WgpuLimits::downlevel_webgl2_defaults(),
+                // Start from `downlevel_webgl2_defaults()` (compute=0,
+                // matches Panfrost-on-Midgard which has 0 SSBO support
+                // and tight compute limits — wgpu's default Limits and
+                // `downlevel_defaults` both want max_compute_workgroup_
+                // size_y=256 but Panfrost caps at 128), then BUMP just
+                // the 2D texture dimension to cover Shannon's 3440×1440
+                // ultrawide monitor. The 2048 default is the spec floor
+                // for GLES 3.0/WebGL2 but Panfrost actually exposes
+                // larger textures (Mali Midgard hardware supports up to
+                // 4096×4096). 4096 covers all common monitor resolutions
+                // (including 4K narrow-aspect crops) without straying
+                // outside what Panfrost reliably supports.
+                limits: {
+                    let mut l = WgpuLimits::downlevel_webgl2_defaults();
+                    l.max_texture_dimension_2d = 4096;
+                    l
+                },
                 #[cfg(target_os = "linux")]
                 backends: Some(Backends::GL),
                 ..default()
