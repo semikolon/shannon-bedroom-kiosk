@@ -51,10 +51,33 @@ struct StatusText;
 
 fn main() {
     App::new()
-        // Reactive update mode: Bevy only renders frames in response to input
-        // events. Still recommended on HW-GLES for power efficiency (idle
-        // CPU drops near-zero; only re-renders on real input).
-        .insert_resource(WinitSettings::desktop_app())
+        // FPS-capped reactive mode (~30 Hz max), chosen to mitigate
+        // Mali T860 Panfrost stability issues. Uncapped continuous render
+        // (WinitSettings::game()) wedged Shannon within 15 s on May 13.
+        // The hypothesis (per research — Maíra Canal's GPU-sched-leak
+        // patch series + RK3399 voltage-coupling devfreq instability):
+        // sustained high-rate GPU job submission stresses the Panfrost
+        // job scheduler + devfreq OPP transitions to a kernel-wedge
+        // state. Capping submission to ~30/sec drastically reduces job
+        // queue pressure without sacrificing input responsiveness.
+        //
+        // 33 ms = ~30 fps. Lower latency than desktop_app() (which uses
+        // a 24-hour wait) by orders of magnitude — gamepad input visible
+        // within 33 ms.
+        .insert_resource(WinitSettings {
+            focused_mode: bevy::winit::UpdateMode::Reactive {
+                wait: std::time::Duration::from_millis(33),
+                react_to_device_events: true,
+                react_to_user_events: true,
+                react_to_window_events: true,
+            },
+            unfocused_mode: bevy::winit::UpdateMode::Reactive {
+                wait: std::time::Duration::from_millis(33),
+                react_to_device_events: true,
+                react_to_user_events: true,
+                react_to_window_events: true,
+            },
+        })
         .insert_resource(ClearColor(BG))
         .init_resource::<MenuState>()
         .add_plugins(
@@ -249,6 +272,9 @@ fn menu_navigation_system(
     let n = MENU_ITEMS.len();
 
     for ev in button_events.read() {
+        // Debug: log every button event so we can verify input flow
+        // in the journal. Drop this once stable Phase 2 is verified.
+        info!("gamepad button {:?} value={}", ev.button_type, ev.value);
         // Only react on press (value > 0.5), not release
         if ev.value <= 0.5 {
             continue;

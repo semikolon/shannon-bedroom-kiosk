@@ -54,43 +54,58 @@ ssh shannon 'shannon-mode set blank; systemctl stop shannon-display.service; syn
 4. **Watchdog won't auto-recover most freezes** — pid1 keeps petting `/dev/watchdog0` even when userspace is wedged. Always pull-and-replug Shannon's USB-C power.
 5. **NEVER add the kiosk to systemd auto-start** until stable for many days. Currently `shannon-display.service` is `disabled` deliberately — boot to console, kiosk only via explicit `shannon-mode now`. This makes power-cycle recovery from a bad kiosk change graceful.
 
-## Status of major pre-Phase-2 unlocks (May 13, 2026)
+## Status (May 13, 2026 — evening)
 
-### ✅ wgpu-hal Mali T860 HW-GLES patch — BUILT (not deployed)
+### ✅ HW-GLES path UNLOCKED end-to-end through wgpu/Bevy stack
 
-Vendored at `vendored/wgpu-hal-0.21.1-mali-fix/` with the retry-loop backport of upstream PRs #7952 + #9153 applied to `src/gles/egl.rs:548-613` (search `BEGIN mali-fix patch` in the file). Root `Cargo.toml` has `[patch.crates-io] wgpu-hal = { path = ... }`. Cross-build verified on Darwin: `2m 23s` clean, 0 errors, 147 routine wgpu-hal warnings (typical for the upstream code on this backend combo). Output binary at `darwin:~/shannon-kiosk-build/shannon-bedroom-kiosk/target/aarch64-unknown-linux-gnu/release/shannon-kiosk`.
+Vendored wgpu-hal 0.21.1-mali-fix at `vendored/wgpu-hal-0.21.1-mali-fix/` with 4-patch evolution (`dc09bfb`, `715917a`, `cd615e0`, `2128543`):
+1. **Robustness retry loop** Core→Ext→None on `BadAttribute|BadMatch|BadConfig` (backports upstream PRs #7952 + #9153)
+2. **`WGPU_GL_PREFER_GLES=1` env override** forces `bind_api(OPENGL_ES_API)` instead of probing CLIENT_APIS for "OpenGL" — Panfrost desktop-GL caps at 3.1 below wgpu's 3.3 floor; its GLES 3.1 satisfies wgpu's GLES-backend min of 3.0+
+3. **`EGL_PLATFORM=x11` veto** on Wayland EGL platform selection — matches the X11 window Bevy emits via Xwayland under cage; ALSO drop the `wayland` Bevy feature so winit can only emit X11 windows (bypasses the wgpu-hal Wayland re-init bug that terminates the AdapterContext's display)
+4. **`max_texture_dimension_2d=4096`** to fit ultrawide 3440×1440 monitor (default 2048 is the WebGL2 floor)
 
-**Patch port specifics**: v0.21.1's `egl.rs` calls `egl.bind_api(...)` once at function entry rather than per-attempt, so we didn't need #9153's closure pattern. The patch just wraps the existing `create_context` call in a retry loop with Core→Ext→None robustness degradation on `BadAttribute | BadMatch | BadConfig` errors. ~100 lines net.
+Bevy `WgpuSettings::priority=WebGL2` + custom limits keep us in the GLES 3.0/WebGL2 feature subset (Panfrost-on-Midgard doesn't implement VERTEX_STORAGE and caps compute_workgroup at 128). `WinitSettings::Reactive { wait: 33 ms }` = ~30 fps cap.
 
-**Deploy preconditions** (still gating — DO NOT push the new binary to Shannon yet):
-1. Shannon instrumentation items 4 + 5 fully landed (see § E in research doc)
-2. HA-only baseline observation period 24-48h (kiosk MODE=blank, eliminates kiosk-induced freezes from the picture)
-3. Mode script change: `~/dotfiles/system/shannon/etc/shannon-modes/shannon-kiosk.sh` needs `VK_ICD_FILENAMES` removed AND `WGPU_BACKEND=gl` added (NOT done yet — keeps lavapipe still active as a revert path)
+**Phase 2 retro UI rendered visually** on the bedroom monitor — amber-on-black "SHANNON" title + 5-item menu (GAMES / MEDIA / LIGHTS / SENSORS / SLEEP) with Press Start 2P pixel font. User confirmed visible briefly before each freeze.
 
-When all three are met, deploy via the standard pattern:
-```bash
-ssh darwin 'cat ~/shannon-kiosk-build/shannon-bedroom-kiosk/target/aarch64-unknown-linux-gnu/release/shannon-kiosk' \
-  | ssh shannon 'cat > /usr/local/bin/shannon-kiosk && chmod +x /usr/local/bin/shannon-kiosk && sync'
-ssh shannon 'shannon-mode now shannon-kiosk; sync'
-```
-Then verify HW acceleration is actually used (Mesa env: `MESA_DEBUG=1 EGL_LOG_LEVEL=debug` should show `panfrost_dri.so` loaded; GPU frame timing in Bevy diagnostics should drop ~5-10× vs lavapipe).
+### 🟥 BLOCKER — sustained kiosk runtime wedges Shannon
 
-### 🟨 Shannon instrumentation items 4 + 5 — STAGED (item 5 ready, item 4 awaiting address pick)
+Within seconds-to-minutes of `shannon-display.service` start, Shannon deep-wedges: ICMP unresponsive, SSH dies, hardware watchdog never fires (pid1 stays alive enough to pet it), no kernel panic, no pstore capture. Heartbeat shows perfectly normal state right before freeze (load 0.13, temp 55C, no PSI, no dirty pages) — **cliff-edge wedge with zero warning**. Only recovery: power-cycle.
 
-Item 5 (userspace canary watchdog) ready to deploy via `hemma system-apply shannon`. Will trigger interactive prompt; user runs manually.
+**Mitigations attempted May 13 (all FAILED to stabilize)**:
+- `PAN_MESA_DEBUG=no_afbc` (Mesa Arm Frame Buffer Compression off)
+- `WGPU_GLES_MINOR_VERSION=0` (force GLES 3.0 code paths)
+- `WinitSettings::game()` (continuous render) — wedges in ~15s
+- `WinitSettings::Reactive { wait: 33 ms }` (30 Hz cap) — wedges in ~30s
+- `echo $max > /sys/class/devfreq/ff9a0000.gpu/min_freq` (clamp GPU min freq high; eliminate OPP transitions) — write succeeded cleanly, kiosk still wedges after launch
 
-Item 4 (pstore + ramoops) script + systemd unit staged + harmless (inert without ramoops backing). Kernel-cmdline edit deferred — research doc's proposed `0xff000000` is RK3399 SoC MMIO, NOT DRAM. See research doc § E item 4 "Address conflict finding" for the corrected analysis and three options (`memmap=1M$0x70000000` is the most likely candidate; needs user nod before editing `/boot/armbianEnv.txt`).
+**Telemetry observation**: at moment of wedge, simple_ondemand governor downclocked GPU to 200MHz reading Bevy's bursty 30Hz workload as idle. Devfreq is in the picture but not the sole trigger (pinning min_freq=max didn't prevent the wedge — there's a deeper Mali/Panfrost/wgpu interaction).
 
-### 🟨 HA-only baseline 24-48h — pending
+Full retrospective + mitigation table + next-session priorities: [`~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md`](../../dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md) § G2.
 
-Clock has been reset twice today by planned Vattenfall power outages (06:30-08:30 + 14:30-16:30). Restart the baseline window after item 5 lands.
+### 🟢 Infrastructure that's now in place (May 13)
 
-## Next-session focus (Phase 2)
+- **Smart-plug autonomous recovery**: `~/.local/bin/shannon-power-cycle` (Tuya Cloud OpenAPI). Device ID `bf6687a9d79a30c121ytru`. Empirically 5-sec off-cycle reliably reboots Shannon, comes back in ~30s. HA-independent (HA runs ON Shannon).
+- **High-frequency GPU+kernel telemetry**: `system/shannon/usr/local/sbin/shannon-gpu-telemetry` runs every 10s via cron, logs to `/var/log.hdd/shannon-gpu-telemetry.log` (SD-shadow, survives wedges). Captures Panfrost devfreq state, governor, cur/min/max freq, PSI cpu/io/mem, kiosk-procs, thermal.
+- **`dmesg-stream` background capture** from mode script — `dmesg -wT` → `/var/log.hdd/dmesg-stream.log`. Status: tonight's freezes happened too fast for ext4 commit=120 to flush; need netconsole UDP for next attempt.
+- **pstore + ramoops** configured (item 4 from research doc § E). Empty after every freeze because no kernel panic happens; this class doesn't generate pstore captures.
 
-Retro UI shell: pixel-font + main-menu navigation IA + Xbox-controller input mapping + CRT shader (post-processing pass over Bevy's default 2D pipeline). Outstanding decisions:
-- Palette: amber-on-black (CRT-monitor era) vs green-on-black (terminal era) vs full-color retro-game palette
-- Pixel font: Press Start 2P (the default candidate per research doc) vs an actual NES/SNES bitmap font ripped from a public-domain font pack
-- Menu structure: flat (games / movies / lights / quit) vs nested (Games > NES > ...) — first cut is flat for simplicity
+## Workload policy — DO NOT BUILD ON SHANNON
+
+Per [`~/dotfiles/system/shannon/README.md`](../../dotfiles/system/shannon/README.md) § "Workload policy — heavy I/O OFF Shannon" — Rust crate compiles, large apt installs, anything that writes >50 MB sustained MUST be cross-compiled elsewhere. The canonical Rust cross-compile pattern: source on Mac Mini → rsync to Darwin → `cross build --target aarch64-unknown-linux-gnu --release` on Darwin → scp single binary (~25 MB) to Shannon. **This is followed throughout the kiosk dev cycle.**
+
+## Next-session focus (priority order)
+
+1. **Kernel 6.12 LTS pin** — Helios64 + Pinebook Pro communities both report 6.12 as last stable RK3399 baseline. Armbian has `linux-image-current-rockchip64` LTS branch.
+2. **Netconsole UDP setup** (research doc § E item 6) — captures kernel ring buffer over UDP to Mac Mini, survives wedge as long as brcmfmac WiFi stays alive. Vulnerable to WiFi-firmware-crash class but worth setting up — current `dmesg-stream` to SD is too slow.
+3. **Mesa 25.3.2 upgrade** — current 25.0.7-2 is ~6 months old, Panfrost has had ongoing fixes.
+4. **Drop cage + run direct DRM/KMS** — eliminate Xwayland-under-cage layer entirely. winit supports KMS/DRM-direct.
+5. **Drop wgpu + raw GLES via SDL2** — biggest rewrite but Mali Panfrost has been verified stable for retro emulators (Retroarch) and mpv on this exact hardware. The freeze may be wgpu-specific.
+
+Outstanding Phase 2 design choices (NOT blocking — easy to tweak):
+- Palette: amber-on-black chosen ✓
+- Pixel font: Press Start 2P chosen ✓
+- Menu structure: flat 5-item — `GAMES / MEDIA / LIGHTS / SENSORS / SLEEP` ✓
 
 ## Cross-references
 
