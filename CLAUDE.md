@@ -71,7 +71,11 @@ Bevy `WgpuSettings::priority=WebGL2` + custom limits keep us in the GLES 3.0/Web
 
 **Phase 2 retro UI rendered visually** on the bedroom monitor — amber-on-black "SHANNON" title + 5-item menu (GAMES / MEDIA / LIGHTS / SENSORS / SLEEP) with Press Start 2P pixel font. User confirmed visible briefly before each freeze.
 
-### 🔄 May 17, 2026 — watchdog-confound reconciliation (READ THIS BEFORE THE BLOCKER WRITEUP BELOW)
+### ✅ May 17, 2026 — PHASE 2 VALIDATED (watchdog-confound proven by experiment; BLOCKER below is SUPERSEDED)
+
+**Confound-free bifurcation re-test EXECUTED May 17 ~23:00 CEST → the BLOCKER writeup below is RESOLVED.** With both confounds removed (watchdog observability-only + Demeter USB rootfs), the *exact* May-13 binaries ran rock-stable: minimal Bevy core **6+ min**, full Phase-2 retro menu **5+ min** — uptime monotonic (no reboot), PSI cpu/io ~0.00, `SYSRQ FIRED`=0, HA=200 throughout, Mali-T860 Panfrost adapter clean. The "deep-wedges in 19-27 s, 4+ times" blocker was the `shannon-watchdog` SYSRQ footgun (triple-checked → proven twice). The genuine-Mali residual is **refuted by experiment**. **The escalation ladder (SDL2 / kernel-6.12 / Mesa-25.3.2 / drop-cage / vendor-blob) is MOOTED — do NOT execute it.** Bevy 0.14 + vendored wgpu-hal-0.21.1-mali-fix + cage + Mesa-Panfrost-25.0.7 is viable as-is. Only residue: a ≥1 h soak before `systemctl enable shannon-display.service`. Canonical record: `~/dotfiles/docs/shannon_bedroom_kiosk_plan_2026_05_06.md` Implementation log "May 17 ~23:00 — bifurcation test EXECUTED".
+
+### 🔄 May 17, 2026 — watchdog-confound reconciliation (the pre-test analysis that predicted the above — kept for the reasoning trail)
 
 The "🟥 BLOCKER" writeup below is **preserved but now known to be watchdog-SYSRQ-confounded** (triple-checked May 17). `shannon-watchdog` (the SYSRQ-force-panic footgun, root-caused for the boot-loop saga in `~/dotfiles/docs/demeter_excavation_2026_05_14.md` § ROOT-CAUSE CORRECTION) was **also firing on the May-13 kiosk night itself** — `shannon-watchdog.log.2.gz`: `SYSRQ FIRED` at 2026-05-13T23:51:14 and 23:55:01 (box healthy, load <0.7, ~3.6 GB free), plus continuous `FAIL n/3 — HA_unreachable` all evening. The "no kernel panic / cliff-edge / pstore empty" symptom below was a survivor-logging illusion (zram `/var/log` dies with the panic; only the sync-after-write watchdog log survived). **Both historical confounds are eliminated as of May 17**: watchdog is observability-only (SYSRQ-panic deleted) + rootfs is on Demeter USB (SD-I/O class gone). **Honest caveat: this does NOT prove there's no genuine sub-90 s Mali/wgpu deadlock underneath** (minimal-Bevy "19-27 s" < the ~90 s watchdog window) — the residual is *unknown, not refuted*; the confound destroyed the clean signal. Full reconciliation: `~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md` § G2 → "May 17, 2026 — watchdog-confound reconciliation". **The escalation ladder in "Next-session focus" was premised on confounded data — run the confound-free bifurcation re-test FIRST.**
 
@@ -103,7 +107,13 @@ Per [`~/dotfiles/system/shannon/README.md`](../../dotfiles/system/shannon/README
 
 ## Next-session focus (priority order)
 
-**0. (DO THIS FIRST — supersedes items 1-5 until done) Confound-free bifurcation re-test.** Both May-13 confounds (watchdog-SYSRQ-panic + SD-rootfs) eliminated May 17 (watchdog observability-only + Demeter USB rootfs). Re-deploy the minimal Bevy isolation binary, run 5 min, read PSI cpu vs io from the surviving `/var/log.hdd/shannon-gpu-telemetry.log`. **No-wedge → Phase 2 GO; PSI-io-spike → mitigate I/O; PSI-cpu-spike-with-no-SYSRQ → genuine Mali, THEN items 1-5 apply.** Full runbook + decision tree: `~/dotfiles/docs/shannon_bedroom_kiosk_plan_2026_05_06.md` Implementation log → May 17, 2026 entry. Fleet-gated + human-scheduled (deploy+run on the live IoT hub — not during bedroom media / not overnight).
+**0. ✅ DONE May 17 — confound-free bifurcation re-test EXECUTED → Phase 2 GO** (minimal 6+ min + full menu 5+ min, rock-stable, zero SYSRQ). **Items 1-5 below are MOOTED — do NOT execute** (they were premised on confounded data). Kept only as the superseded analysis trail.
+
+**NOW THE FOCUS — Phase 3** (action-handler daemon, the real next deliverable):
+- Rust + axum localhost daemon at `127.0.0.1:8080`, separate binary (NOT in the Bevy process). Endpoints: `/launch/retroarch?core=&rom=`, `/lights/<group>/<action>` (proxy HA REST), `/launch/chromium?url=` (streaming).
+- Wire the already-installed gaming stack (RetroArch + 6 libretro cores + xpadneo + mrboom, done May 6) into the menu's 🎮 Games submenu.
+- Bevy menu POSTs to the daemon; on child-process exit, Bevy regains focus (cage stays the compositor).
+- **Gate before kiosk auto-start** (`shannon-display.service` stays `disabled`): one ≥1 h unattended soak (overnight, bedroom display unused) confirming multi-hour stability. 5-6 min proved the confound; only a long soak proves 24/7. This is the lone Fleet-gated residue.
 
 1. **Kernel 6.12 LTS pin** — Helios64 + Pinebook Pro communities both report 6.12 as last stable RK3399 baseline. Armbian has `linux-image-current-rockchip64` LTS branch.
 2. **Netconsole UDP setup** (research doc § E item 6) — captures kernel ring buffer over UDP to Mac Mini, survives wedge as long as brcmfmac WiFi stays alive. Vulnerable to WiFi-firmware-crash class but worth setting up — current `dmesg-stream` to SD is too slow.
