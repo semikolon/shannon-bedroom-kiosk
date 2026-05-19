@@ -1,0 +1,568 @@
+//! Phase-3A bedroom display/power **context engine** (Slice 1).
+//!
+//! A four-state machine — `Off` / `Kiosk` / `Content` / `Ambient` — that
+//! owns the bedroom TV so the user never touches the TV (or Argon) remote.
+//! Pure + deterministic: the caller injects every signal (including the
+//! clock); the engine never does I/O. The real HA-smart-plug actuator is a
+//! later one-line `TvPower` adapter swap; tests drive `SimTvPower`.
+//!
+//! Decision order, presence oracle, the time-conditioned sleep-aware
+//! true-OFF leash, and the passive idle-only guardrail are specified in
+//! the design doc (§ 4 / § 6 / § 7). Keep this file in sync with it.
+
+#![forbid(unsafe_code)]
+
+use std::time::Duration;
+
+/// Local wall-clock as minutes since midnight (`0..1440`). Injected by the
+/// caller — the engine never reads a system clock, so tests are
+/// deterministic (*split semantic from temporal*: engine decides WHAT, the
+/// caller supplies WHEN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClockMinutes(u16);
+
+impl ClockMinutes {
+    /// Minutes in a day.
+    pub const DAY: u16 = 24 * 60;
+
+    /// Construct from `h:m`, wrapping into `0..1440`.
+    #[must_use]
+    pub fn at(h: u16, m: u16) -> Self {
+        Self((h.wrapping_mul(60).wrapping_add(m)) % Self::DAY)
+    }
+
+    /// Raw minutes since midnight.
+    #[must_use]
+    pub fn raw(self) -> u16 {
+        self.0 % Self::DAY
+    }
+}
+
+/// On-screen activity that *is* the point (stays on while engaged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    Video,
+    Game,
+}
+
+/// Adaptive-dim ambient screensaver brightness, clamped to `0.0..=1.0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Brightness(f32);
+
+impl Brightness {
+    #[must_use]
+    pub fn new(v: f32) -> Self {
+        Self(v.clamp(0.0, 1.0))
+    }
+
+    #[must_use]
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+/// The four bedroom display/power states.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DisplayState {
+    /// Smart-plug cuts the TV; room dark.
+    Off,
+    /// The stable hybrid retro menu (validated Phase 2).
+    Kiosk,
+    /// A video or running game — the content is the point.
+    Content(Activity),
+    /// Calm, adaptively-dim creative screensaver while present-but-idle.
+    Ambient(Brightness),
+}
+
+impl DisplayState {
+    /// Is the TV powered in this state?
+    #[must_use]
+    pub fn powered(self) -> bool {
+        !matches!(self, DisplayState::Off)
+    }
+}
+
+/// What audio/video is currently playing (the engine's content signal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Media {
+    None,
+    Music,
+    Video,
+    Game,
+}
+
+/// The Xbox on/off button — the TV-remote replacement. Sticky until a
+/// fresh controller interaction (a new deliberate intent) or the hard-off
+/// floor supersedes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Manual {
+    ForceOn,
+    ForceOff,
+}
+
+/// All observable signals for one evaluation tick. Everything is injected:
+/// the engine reads no clock, no device, no network.
+#[derive(Debug, Clone, Copy)]
+pub struct Inputs {
+    /// Local wall-clock (caller-supplied).
+    pub now: ClockMinutes,
+    /// Xbox controller currently BT-connected (presence: present vs gone).
+    pub controller_connected: bool,
+    /// Time since the last controller button/axis input (idle oracle).
+    pub since_controller_input: Duration,
+    /// A fresh controller input arrived this tick (supersedes a stale
+    /// manual override — a new deliberate intent).
+    pub fresh_controller_input: bool,
+    /// What is playing right now.
+    pub media: Media,
+    /// Outdoor brightness `0.0..=1.0` (the solar-curve proxy that drives
+    /// adaptive-dim Ambient — no in-room light sensor needed).
+    pub outdoor_brightness: f32,
+    /// A fresh Xbox on/off press this tick, if any.
+    pub manual_press: Option<Manual>,
+}
+
+/// Tunable parameters. **Architecture-vs-parameters**: that these knobs
+/// *exist* is decided; their *values* are observation-tuned — do not ask,
+/// observe. Defaults are documented starting guesses.
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    /// Connected + idle ≥ this → Ambient (a short grace as Kiosk first).
+    pub idle_to_ambient: Duration,
+    /// Daytime idle leash before true-OFF (long; instant-on premise).
+    pub day_idle_to_off: Duration,
+    /// Evening idle leash before true-OFF (short; the sleep nudge).
+    pub night_idle_to_off: Duration,
+    /// Controller-disconnected grace held as Ambient before OFF.
+    pub disconnect_grace: Duration,
+    /// When the evening short-leash begins (the user's sleep rhythm —
+    /// tunable; no clock-cognitive-mode assumption is baked in).
+    pub winddown_start: ClockMinutes,
+    /// Post-midnight hard-off floor start (mirrors bedroom-lights).
+    pub hard_off_start: ClockMinutes,
+    /// Hard-off floor end / day begins.
+    pub hard_off_end: ClockMinutes,
+    /// Ambient brightness floor at zero outdoor light (day).
+    pub ambient_min: f32,
+    /// Ambient brightness ceiling at full outdoor light (day).
+    pub ambient_max: f32,
+    /// Multiplier applied to Ambient brightness during evening wind-down
+    /// (near-black at night; the user wants the room to go dark).
+    pub winddown_dim_factor: f32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            idle_to_ambient: Duration::from_secs(3 * 60),
+            day_idle_to_off: Duration::from_secs(150 * 60), // ~2.5 h
+            night_idle_to_off: Duration::from_secs(30 * 60), // ~30 m
+            disconnect_grace: Duration::from_secs(2 * 60),
+            winddown_start: ClockMinutes::at(22, 0),
+            hard_off_start: ClockMinutes::at(0, 0),
+            hard_off_end: ClockMinutes::at(7, 0),
+            ambient_min: 0.04,
+            ambient_max: 0.45,
+            winddown_dim_factor: 0.30,
+        }
+    }
+}
+
+impl Config {
+    fn is_hard_off(&self, now: ClockMinutes) -> bool {
+        (self.hard_off_start.raw()..self.hard_off_end.raw()).contains(&now.raw())
+    }
+
+    fn is_winddown(&self, now: ClockMinutes) -> bool {
+        // Not hard-off, and at/after the evening short-leash start.
+        !self.is_hard_off(now) && now.raw() >= self.winddown_start.raw()
+    }
+
+    fn idle_leash(&self, now: ClockMinutes) -> Duration {
+        if self.is_winddown(now) {
+            self.night_idle_to_off
+        } else {
+            self.day_idle_to_off
+        }
+    }
+
+    /// Adaptive-dim Ambient brightness. Monotonic in outdoor light;
+    /// strictly dimmer during wind-down at equal outdoor light; bounded.
+    #[must_use]
+    pub fn ambient_brightness(&self, now: ClockMinutes, outdoor: f32) -> Brightness {
+        let o = outdoor.clamp(0.0, 1.0);
+        let base = self.ambient_min + (self.ambient_max - self.ambient_min) * o;
+        let scaled = if self.is_winddown(now) {
+            base * self.winddown_dim_factor
+        } else {
+            base
+        };
+        Brightness::new(scaled)
+    }
+}
+
+/// A side-effect the host (axum daemon / Bevy) must apply. Power is
+/// emitted as an action (the engine *decides* autonomously; the adapter
+/// *applies*) so the engine stays pure.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Action {
+    /// Drive the TV smart-plug (autonomous power).
+    SetTvPower(bool),
+    /// Paint this state (the host renders Kiosk/Content/Ambient).
+    Show(DisplayState),
+}
+
+/// Result of one tick.
+#[derive(Debug, Clone)]
+pub struct StepOutcome {
+    pub state: DisplayState,
+    pub actions: Vec<Action>,
+}
+
+/// The TV power port. Slice 1 ships `SimTvPower`; the real
+/// `HaSmartPlugTvPower` (HA REST) is a Slice-2 adapter — same trait.
+pub trait TvPower {
+    fn set_power(&mut self, on: bool);
+    fn is_on(&self) -> bool;
+}
+
+/// In-memory `TvPower` recorder for deterministic tests (and a dev stub).
+#[derive(Debug, Default, Clone)]
+pub struct SimTvPower {
+    on: bool,
+    /// Every power level the engine drove, in order.
+    pub history: Vec<bool>,
+}
+
+impl TvPower for SimTvPower {
+    fn set_power(&mut self, on: bool) {
+        self.on = on;
+        self.history.push(on);
+    }
+
+    fn is_on(&self) -> bool {
+        self.on
+    }
+}
+
+/// The context engine. Carries the current state + the sticky manual
+/// override; `step` is the only mutator.
+#[derive(Debug, Clone)]
+pub struct Engine {
+    state: DisplayState,
+    manual: Option<Manual>,
+    cfg: Config,
+}
+
+impl Engine {
+    #[must_use]
+    pub fn new(cfg: Config) -> Self {
+        Self {
+            state: DisplayState::Off,
+            manual: None,
+            cfg,
+        }
+    }
+
+    #[must_use]
+    pub fn state(&self) -> DisplayState {
+        self.state
+    }
+
+    /// Pure decision given the carried manual override (precedence: design
+    /// doc § 4 — first match wins).
+    fn decide(&self, i: &Inputs) -> DisplayState {
+        let cfg = &self.cfg;
+
+        // 1. Post-midnight hard-off floor — "off no matter what" (rides
+        //    the bedroom-lights floor; one room winds down together).
+        if cfg.is_hard_off(i.now) {
+            return DisplayState::Off;
+        }
+
+        // 2. Manual override dominates inferred state.
+        match self.manual {
+            Some(Manual::ForceOff) => return DisplayState::Off,
+            Some(Manual::ForceOn) => {
+                return match i.media {
+                    Media::Video => DisplayState::Content(Activity::Video),
+                    Media::Game => DisplayState::Content(Activity::Game),
+                    Media::Music | Media::None => DisplayState::Kiosk,
+                };
+            }
+            None => {}
+        }
+
+        // 3. Content engagement — never shortened by the night leash
+        //    (the passive guardrail; design doc § 7).
+        match i.media {
+            Media::Video => return DisplayState::Content(Activity::Video),
+            Media::Game => return DisplayState::Content(Activity::Game),
+            Media::Music => {
+                // 4. Music beats present-idle: TV off while music plays,
+                //    UNLESS actively using the controller (then Kiosk).
+                let active =
+                    i.controller_connected && i.since_controller_input < cfg.idle_to_ambient;
+                return if active {
+                    DisplayState::Kiosk
+                } else {
+                    DisplayState::Off
+                };
+            }
+            Media::None => {}
+        }
+
+        // 5. Controller-presence/idle oracle.
+        if i.controller_connected {
+            if i.since_controller_input < cfg.idle_to_ambient {
+                DisplayState::Kiosk
+            } else if i.since_controller_input < cfg.idle_leash(i.now) {
+                DisplayState::Ambient(cfg.ambient_brightness(i.now, i.outdoor_brightness))
+            } else {
+                DisplayState::Off
+            }
+        } else {
+            // 6. Disconnected: brief grace as Ambient, then OFF.
+            if i.since_controller_input < cfg.disconnect_grace {
+                DisplayState::Ambient(cfg.ambient_brightness(i.now, i.outdoor_brightness))
+            } else {
+                DisplayState::Off
+            }
+        }
+    }
+
+    /// Advance one tick. Updates the sticky manual override, recomputes
+    /// the state, and emits power + render actions on change.
+    pub fn step(&mut self, i: &Inputs) -> StepOutcome {
+        // Sticky manual: a fresh press sets it; a fresh controller
+        // interaction or the hard-off floor clears it (new intent /
+        // floor reset).
+        if let Some(m) = i.manual_press {
+            self.manual = Some(m);
+        }
+        if i.fresh_controller_input || self.cfg.is_hard_off(i.now) {
+            self.manual = None;
+        }
+
+        let prev = self.state;
+        let next = self.decide(i);
+
+        let mut actions = Vec::new();
+        if next.powered() != prev.powered() {
+            actions.push(Action::SetTvPower(next.powered()));
+        }
+        if next != prev {
+            actions.push(Action::Show(next));
+        }
+        self.state = next;
+
+        StepOutcome {
+            state: next,
+            actions,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    /// Sensible mid-day, controller-connected, just-interacted baseline.
+    fn base() -> Inputs {
+        Inputs {
+            now: ClockMinutes::at(15, 0),
+            controller_connected: true,
+            since_controller_input: Duration::from_secs(1),
+            fresh_controller_input: false,
+            media: Media::None,
+            outdoor_brightness: 0.6,
+            manual_press: None,
+        }
+    }
+
+    fn eng() -> Engine {
+        Engine::new(Config::default())
+    }
+
+    #[test]
+    fn recent_controller_input_is_kiosk() {
+        let mut e = eng();
+        assert_eq!(e.step(&base()).state, DisplayState::Kiosk);
+    }
+
+    #[test]
+    fn connected_idle_becomes_ambient_then_off_by_day_leash() {
+        let mut e = eng();
+        let mut i = base();
+        i.since_controller_input = Duration::from_secs(10 * 60); // > 3m, < 2.5h
+        assert!(matches!(e.step(&i).state, DisplayState::Ambient(_)));
+        i.since_controller_input = Duration::from_secs(200 * 60); // > 2.5h day leash
+        assert_eq!(e.step(&i).state, DisplayState::Off);
+    }
+
+    #[test]
+    fn night_leash_is_aggressive_day_leash_is_not_same_idle() {
+        // 40 min idle: still Ambient in the day window, OFF in wind-down.
+        let mut e = eng();
+        let mut i = base();
+        i.since_controller_input = Duration::from_secs(40 * 60);
+
+        i.now = ClockMinutes::at(15, 0); // day
+        assert!(matches!(e.step(&i).state, DisplayState::Ambient(_)));
+
+        i.now = ClockMinutes::at(23, 0); // evening wind-down
+        assert_eq!(e.step(&i).state, DisplayState::Off);
+    }
+
+    #[test]
+    fn content_is_never_shortened_by_the_night_leash_guardrail() {
+        // Video playing, deep into the evening, very long since input —
+        // engagement must NOT be cut. (Design § 7 passive guardrail.)
+        let mut e = eng();
+        let mut i = base();
+        i.media = Media::Video;
+        i.now = ClockMinutes::at(23, 30);
+        i.since_controller_input = Duration::from_secs(180 * 60);
+        assert_eq!(e.step(&i).state, DisplayState::Content(Activity::Video));
+    }
+
+    #[test]
+    fn hard_off_floor_dominates_everything() {
+        let mut e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(3, 0); // inside 00:00–07:00 floor
+        i.media = Media::Video; // would otherwise be Content
+        i.manual_press = Some(Manual::ForceOn); // even an explicit ForceOn
+        assert_eq!(e.step(&i).state, DisplayState::Off);
+    }
+
+    #[test]
+    fn music_with_no_active_controller_turns_tv_off() {
+        let mut e = eng();
+        let mut i = base();
+        i.media = Media::Music;
+        i.since_controller_input = Duration::from_secs(30 * 60); // idle
+        assert_eq!(e.step(&i).state, DisplayState::Off);
+    }
+
+    #[test]
+    fn music_but_actively_controllering_stays_kiosk() {
+        let mut e = eng();
+        let mut i = base();
+        i.media = Media::Music;
+        i.since_controller_input = Duration::from_secs(2); // active
+        assert_eq!(e.step(&i).state, DisplayState::Kiosk);
+    }
+
+    #[test]
+    fn manual_force_off_overrides_content_until_fresh_input_clears_it() {
+        let mut e = eng();
+        let mut i = base();
+        i.media = Media::Video;
+        i.manual_press = Some(Manual::ForceOff);
+        assert_eq!(e.step(&i).state, DisplayState::Off); // override beats Content
+
+        i.manual_press = None;
+        assert_eq!(e.step(&i).state, DisplayState::Off); // sticky
+
+        i.fresh_controller_input = true; // new deliberate intent clears it
+        assert_eq!(e.step(&i).state, DisplayState::Content(Activity::Video));
+    }
+
+    #[test]
+    fn manual_force_on_shows_content_if_playing_else_kiosk() {
+        let mut e = eng();
+        let mut i = base();
+        i.since_controller_input = Duration::from_secs(999 * 60); // would be Off
+        i.manual_press = Some(Manual::ForceOn);
+        assert_eq!(e.step(&i).state, DisplayState::Kiosk);
+
+        let mut e2 = eng();
+        let mut i2 = base();
+        i2.media = Media::Game;
+        i2.manual_press = Some(Manual::ForceOn);
+        assert_eq!(e2.step(&i2).state, DisplayState::Content(Activity::Game));
+    }
+
+    #[test]
+    fn disconnect_grace_holds_ambient_then_off() {
+        let mut e = eng();
+        let mut i = base();
+        i.controller_connected = false;
+        i.since_controller_input = Duration::from_secs(30); // within 2m grace
+        assert!(matches!(e.step(&i).state, DisplayState::Ambient(_)));
+        i.since_controller_input = Duration::from_secs(5 * 60); // past grace
+        assert_eq!(e.step(&i).state, DisplayState::Off);
+    }
+
+    #[test]
+    fn power_action_emitted_only_on_powered_transition() {
+        let mut e = eng();
+        let mut sim = SimTvPower::default();
+
+        // Off -> Kiosk : power on
+        for a in e.step(&base()).actions {
+            if let Action::SetTvPower(on) = a {
+                sim.set_power(on);
+            }
+        }
+        // Kiosk -> Ambient : still powered, no power action
+        let mut i = base();
+        i.since_controller_input = Duration::from_secs(10 * 60);
+        for a in e.step(&i).actions {
+            if let Action::SetTvPower(on) = a {
+                sim.set_power(on);
+            }
+        }
+        // Ambient -> Off : power off
+        i.since_controller_input = Duration::from_secs(300 * 60);
+        for a in e.step(&i).actions {
+            if let Action::SetTvPower(on) = a {
+                sim.set_power(on);
+            }
+        }
+
+        assert_eq!(sim.history, vec![true, false]);
+        assert!(!sim.is_on());
+    }
+
+    #[test]
+    fn idempotent_tick_emits_no_actions() {
+        let mut e = eng();
+        let i = base();
+        let first = e.step(&i);
+        assert!(!first.actions.is_empty()); // Off -> Kiosk
+        let second = e.step(&i);
+        assert!(second.actions.is_empty()); // no change
+    }
+
+    #[test]
+    fn ambient_brightness_monotonic_bounded_and_dimmer_at_night() {
+        let c = Config::default();
+        let day = ClockMinutes::at(14, 0);
+        let night = ClockMinutes::at(23, 0);
+
+        let dark = c.ambient_brightness(day, 0.0).get();
+        let bright = c.ambient_brightness(day, 1.0).get();
+        assert!(bright > dark, "more outdoor light => brighter");
+        assert!((0.0..=1.0).contains(&dark) && (0.0..=1.0).contains(&bright));
+
+        let day_b = c.ambient_brightness(day, 0.7).get();
+        let night_b = c.ambient_brightness(night, 0.7).get();
+        assert!(night_b < day_b, "wind-down is strictly dimmer");
+        assert!(approx(night_b, day_b * c.winddown_dim_factor));
+
+        // clamps even with absurd outdoor input
+        assert!((0.0..=1.0).contains(&c.ambient_brightness(day, 9.0).get()));
+    }
+
+    #[test]
+    fn clock_minutes_wrap_and_raw() {
+        assert_eq!(ClockMinutes::at(25, 0).raw(), 60);
+        assert_eq!(ClockMinutes::at(23, 59).raw(), 23 * 60 + 59);
+    }
+}

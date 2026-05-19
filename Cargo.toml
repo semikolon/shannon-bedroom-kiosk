@@ -39,6 +39,17 @@ bevy = { version = "0.14", default-features = false, features = [
     "webgl2",
 ] }
 
+# --- Slice 2: shannon-kiosk-actions daemon ONLY ---
+# Used solely by src/bin/shannon-kiosk-actions.rs. The library
+# (context + ha) stays std-only, so `cargo test --lib` / `clippy --lib`
+# never compile these (Slice 1's fast pure core is preserved). rustls
+# (not OpenSSL) keeps the eventual aarch64 cross-compile clean.
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Performance profile for release — Bevy is heavy without optimizations
 [profile.release]
 opt-level = 3
