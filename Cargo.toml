@@ -18,6 +18,7 @@ bevy = { version = "0.18.1", default-features = false, features = [
     "bevy_color",
     "bevy_core_pipeline",
     "bevy_gilrs",          # gamepad input — first-class Xbox controller
+    "bevy_log",            # info!/warn!/error! macros + tracing-based logging
     "bevy_render",
     "bevy_sprite",
     "bevy_sprite_render",  # Bevy 0.18 split: render half of sprite pipeline

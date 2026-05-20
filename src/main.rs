@@ -1,5 +1,6 @@
-//! Shannon bedroom kiosk — Phase 3 production UI (Slice 3c steps 1 + 2).
+//! Shannon bedroom kiosk — Phase 3 production UI on Bevy 0.18.1.
 //!
+//! Migrated from Bevy 0.14 → 0.18.1 (2026-05-20 user-greenlit work).
 //! Engine-driven: the Slice-1 `context::Engine` decides DisplayState
 //! (Off/Kiosk/Content/Ambient) each tick; the Slice-3a `Engine::hint`
 //! predicts cursor + ribbon for the Kiosk state. Bevy renders the
@@ -13,47 +14,39 @@
 //! - **Sarpetorp forest palette** mirrored from the dashboard
 //! - **Six tiles**: Games / Music / Lights / Watch / Sensors / Sleep
 //! - **Y button = ALL OFF** (engine `Manual::ForceOff`)
-//! - **No pixelation** — modern execution of the retro-game-menu UX
-//!   patterns; the amber-on-black + Press Start 2P Phase-2 aesthetic was
-//!   the GPU-stability stepping stone, now superseded
 //!
-//! What this slice DOES ship (steps 1 + 2):
-//! - Vertical 6-tile menu (left ~1/3) with Lucide icons + Sharp Sans
-//!   labels + cursor marker (▸)
-//! - Engine integration (Slice 1 + 3a): per-tick `Inputs` assembled
-//!   from bevy_gilrs + clock; `Engine::step` + `Engine::hint`
-//! - Cursor prediction: user input wins; the hint only nudges when
-//!   there's no recent deliberate D-pad nav
-//! - Y button mapping to `Manual::ForceOff`
-//! - Background image (sarpetorp-clock-bg.jpg, cover-fit + 20% opacity
-//!   over the forest-radial base — mirrors the dashboard's CSS layering)
-//! - Cursor-driven preview pane (right ~2/3) — stable frame, context-
-//!   filled: huge Lucide icon + big label + dim subtitle, all swap with
-//!   the cursor. Per-tile content is placeholder text for Slice 3c; real
-//!   data lands in 3d/3e
-//! - Basic controller chrome bar at the bottom (text-only A/B/Y labels —
-//!   formal colored Xbox-styled chips come in a future step)
+//! Render path: HW-GLES via Mesa Panfrost on Mali T860 (Shannon target).
+//! The vendored wgpu-hal-0.21 Mali patch from the Bevy-0.14 era is
+//! commented out in Cargo.toml; Bevy 0.18 pulls wgpu 27, which may have
+//! the relevant upstream fixes (wgpu PRs #7952 + #9153). If Mali HW-GLES
+//! breaks on Shannon, the patch needs porting to wgpu-hal 27 as a
+//! follow-up commit (see design hub § 13.17).
 //!
-//! What this slice DEFERS:
-//! - Formal Xbox-styled colored circle chips (step 2c follow-up; Bevy
-//!   0.14 lacks UI border_radius)
-//! - Ribbon line styling (3e wires the actual offer)
-//! - 3d: daemon HA polling for media + presence
-//! - 3e: ribbon-offer wiring (resume-last-watched)
-//! - 3f: `BlackoutTvPower` + `HdmiSignalTvPower` actuators
-//! - 3g: Ambient + Off scene roots
-//!
-//! Render path: HW-GLES via Mesa Panfrost on Mali T860 — unchanged from
-//! Phase 2 (the vendored wgpu-hal-0.21.1-mali-fix is still load-bearing).
+//! Bevy 0.15-0.18 API migration applied here:
+//! - Camera2dBundle → Camera2d (Required Components)
+//! - TextBundle → tuple-spawn (Text + TextFont + TextColor + Node)
+//! - NodeBundle → tuple-spawn (Node + BackgroundColor + BorderColor)
+//! - SpriteBundle → tuple-spawn (Sprite + Transform)
+//! - Style { ... } merged into Node { ... } (sibling component instead
+//!   of nested-on-bundle)
+//! - text.sections[0].value → text.0; .sections[0].style.color → query
+//!   the sibling TextColor component
+//! - Query::get_single_mut() → single_mut()
+//! - Res<Gamepads> → Query<&Gamepad>; GamepadButtonType → GamepadButton;
+//!   GamepadAxisType → GamepadAxis; event.button_type → event.button
+//! - WindowResolution::new() instead of (f32, f32).into()
+//! - RenderAssetUsages + CompressedImageFormats moved to bevy::image
+//!   (Bevy 0.18 split bevy_image into its own crate)
 
+use bevy::asset::RenderAssetUsages;
 use bevy::input::gamepad::{GamepadAxisChangedEvent, GamepadButtonChangedEvent};
+use bevy::log::info;
 use bevy::prelude::*;
-use bevy::render::render_asset::RenderAssetUsages;
 #[cfg(target_os = "linux")]
 use bevy::render::settings::Backends;
 use bevy::render::settings::{WgpuLimits, WgpuSettings, WgpuSettingsPriority};
-use bevy::render::texture::{CompressedImageFormats, ImageSampler, ImageType};
 use bevy::render::RenderPlugin;
+use bevy::window::WindowResolution;
 use bevy::winit::WinitSettings;
 use shannon_kiosk::context::{
     ClockMinutes, Config, DisplayState, Engine, Inputs, Manual, Media, MenuItem,
@@ -61,44 +54,24 @@ use shannon_kiosk::context::{
 use std::time::Duration;
 
 // ─── Sarpetorp forest palette (mirrors the dashboard) ────────────────
-// Background = the forest-radial-gradient base (Sarpetorp index.html
-// `background: radial-gradient(circle at center, rgb(18,30,20) 0%,
-// rgb(15,26,18) 100%)`). The inner color is painted as a flat ClearColor
-// behind the bg image; the radial-outer ring is a single-color
-// approximation for now (the full radial gradient is observation-tunable).
 const FOREST_BG: Color = Color::srgb(0.071, 0.118, 0.078); // rgb(18,30,20)
 const OAT_MILK: Color = Color::srgb(0.957, 0.937, 0.898); // primary text
 const OAT_DIM: Color = Color::srgb(0.55, 0.56, 0.49); // secondary text
 const OAT_FAINT: Color = Color::srgb(0.38, 0.39, 0.36); // tertiary text
-const AMBER_ACCENT: Color = Color::srgb(0.94, 0.71, 0.18); // selected + [A] (Sarpetorp "Sol nu" register)
+const AMBER_ACCENT: Color = Color::srgb(0.94, 0.71, 0.18); // selected + [A]
 
-// ─── Embedded font assets ────────────────────────────────────────────
-// include_bytes! bundles fonts into the binary — no `assets/` dir
-// needed at runtime on Shannon, deploys as a single executable. Sharp
-// Sans .otf files are commercial (user-owned personal license),
-// gitignored, copied from ~/Library/Fonts/ at dev time per
-// design hub § 13.3. Lucide is MIT-licensed + committed.
+// ─── Embedded font assets (commit-time bundled into the binary) ──────
 const SHARP_SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/SharpSans-Semibold.otf");
 const SHARP_SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/SharpSans-Bold.otf");
 const LUCIDE: &[u8] = include_bytes!("../assets/fonts/Lucide.ttf");
 
 // ─── Embedded background image ──────────────────────────────────────
-// Mirrored from the Sarpetorp dashboard's top widget (`clock-bg.jpg`).
-// Native 3320×5299 portrait (kiosk-station was rotated 90°); we cover-
-// fit it across the 1920×1080 landscape Shannon TV at 20% opacity over
-// the forest base — the calm-nature-old-house feel per user 2026-05-20:
-// "calm and nature and old-house-y, just like the dashboard."
 const BG_IMAGE: &[u8] = include_bytes!("../assets/backgrounds/sarpetorp-clock-bg.jpg");
-
-// Cover-fit scale: max(1920/3320, 1080/5299) = 0.578. Final sprite is
-// 1920 × 3063 (width matches; height overflows; top + bottom get
-// clipped to window) — center-anchored so the photo's middle band shows.
 const BG_FIT_WIDTH: f32 = 1920.0;
 const BG_FIT_HEIGHT: f32 = 3063.0;
 const BG_OPACITY: f32 = 0.20;
 
 // ─── Lucide codepoints for the six menu tiles ────────────────────────
-// Verified against lucide-codepoints.json v1.16.0 (Slice 3b commit).
 const ICON_GAMES: char = '\u{e0df}'; // gamepad-2
 const ICON_MUSIC: char = '\u{e122}'; // music
 const ICON_LIGHTS: char = '\u{e1c2}'; // lightbulb
@@ -154,25 +127,15 @@ fn menu_index_of(item: MenuItem) -> usize {
 
 // ─── Bevy resources ──────────────────────────────────────────────────
 
-/// The engine + the per-tick accumulator state Bevy needs to feed it.
 #[derive(Resource)]
 struct EngineRes {
     engine: Engine,
     state: DisplayState,
     cursor: MenuItem,
-    // Idle accumulator — reset on any controller input
     since_input: Duration,
-    // Pending inputs collected by `gamepad_event_system`, drained by
-    // `engine_tick_system`:
     fresh_controller_input: bool,
     manual_press: Option<Manual>,
-    // Sticky flag: any keyboard input on the dev host enables a
-    // presence-oracle override so `Engine::decide` enters Kiosk even
-    // without a connected Xbox controller. Production Shannon ignores
-    // this (no keyboard is wired). Set true permanently on the first
-    // keyboard event; reset never (a dev session implies presence).
     dev_keyboard_active: bool,
-    // Placeholders for Slice 3d (daemon HA polling):
     media: Media,
     outdoor_brightness: f32,
 }
@@ -188,8 +151,6 @@ impl Default for EngineRes {
             manual_press: None,
             dev_keyboard_active: false,
             media: Media::None,
-            // Mid-curve midday default until Slice 3d feeds the real
-            // Sarpetorp solar curve via the daemon.
             outdoor_brightness: 0.6,
         }
     }
@@ -220,10 +181,6 @@ struct MenuCursorMarker {
 #[derive(Component)]
 struct StateBadge;
 
-/// Marker for the three preview-pane text spawns; lets one query update
-/// all of them via `match` on the variant. Single-component-with-variant
-/// keeps the system signature simple (clippy-friendly) vs three
-/// independent marker types.
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 enum PreviewElement {
     Icon,
@@ -231,9 +188,6 @@ enum PreviewElement {
     Subtitle,
 }
 
-/// Per-tile preview content. Slice 3c step 2 ships these as placeholders
-/// (icon + label + subtitle); Slice 3d swaps in live data per the
-/// stable-frame-context-filled keystone (design § 1).
 fn preview_for(item: MenuItem) -> (char, &'static str, &'static str) {
     match item {
         MenuItem::Games => (ICON_GAMES, "GAMES", "Recently played"),
@@ -249,9 +203,6 @@ fn preview_for(item: MenuItem) -> (char, &'static str, &'static str) {
 
 fn main() {
     App::new()
-        // Reactive 30 fps cap — preserved from Phase 2; load-bearing
-        // for Mali T860 stability under freq caps (see project
-        // CLAUDE.md "Hardware-stability + freq-cap mitigation").
         .insert_resource(WinitSettings {
             focused_mode: bevy::winit::UpdateMode::Reactive {
                 wait: Duration::from_millis(33),
@@ -288,10 +239,7 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "Shannon".to_string(),
-                        // Bedroom production target is a 1080p TV
-                        // (design § 13 / GPU-research § 1080p note);
-                        // ultrawide just centers more dead space.
-                        resolution: (1920., 1080.).into(),
+                        resolution: WindowResolution::new(1920, 1080),
                         resizable: true,
                         ..default()
                     }),
@@ -314,31 +262,26 @@ fn main() {
 }
 
 fn setup_background(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
-    // Load the bg JPEG from embedded bytes — no runtime assets/ dir
-    // dependency. JFIF/JPG is widely supported by `image` crate which
-    // Bevy uses under the hood.
+    use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
     let image = Image::from_buffer(
         BG_IMAGE,
         ImageType::Extension("jpg"),
         CompressedImageFormats::NONE,
-        true, // is_srgb: JPG is color, not data
+        true,
         ImageSampler::Default,
         RenderAssetUsages::default(),
     )
     .expect("Sarpetorp clock-bg.jpg decodes");
     let handle = images.add(image);
-    commands.spawn(SpriteBundle {
-        texture: handle,
-        sprite: Sprite {
+    commands.spawn((
+        Sprite {
+            image: handle,
             custom_size: Some(Vec2::new(BG_FIT_WIDTH, BG_FIT_HEIGHT)),
             color: Color::srgba(1.0, 1.0, 1.0, BG_OPACITY),
             ..default()
         },
-        // z=-1 to render behind the bevy_ui layer (which defaults to
-        // z=0 on its own UI camera anyway, but explicit > implicit).
-        transform: Transform::from_xyz(0.0, 0.0, -1.0),
-        ..default()
-    });
+        Transform::from_xyz(0.0, 0.0, -1.0),
+    ));
 }
 
 fn load_fonts(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
@@ -356,78 +299,67 @@ fn load_fonts(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
 }
 
 fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
-    commands.spawn(Camera2dBundle::default());
+    commands.spawn(Camera2d);
 
     // Six-tile vertical menu — left side, generous vertical spacing.
     for (i, tile) in MENU.iter().enumerate() {
         let y = 240.0 + (i as f32 * 88.0);
+        let label_color = if i == 0 { OAT_MILK } else { OAT_DIM };
 
         // Cursor marker (▸) — visible only on the selected tile
         commands.spawn((
-            TextBundle {
-                text: Text::from_section(
-                    "▸",
-                    TextStyle {
-                        font: fonts.bold.clone(),
-                        font_size: 32.0,
-                        color: AMBER_ACCENT,
-                    },
-                ),
-                style: Style {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(y),
-                    left: Val::Px(86.0),
-                    ..default()
-                },
-                visibility: if i == 0 {
-                    Visibility::Visible
-                } else {
-                    Visibility::Hidden
-                },
+            Text::new("▸"),
+            TextFont {
+                font: fonts.bold.clone(),
+                font_size: 32.0,
                 ..default()
+            },
+            TextColor(AMBER_ACCENT),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(y),
+                left: Val::Px(86.0),
+                ..default()
+            },
+            if i == 0 {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
             },
             MenuCursorMarker { index: i },
         ));
 
         // Lucide icon
         commands.spawn((
-            TextBundle {
-                text: Text::from_section(
-                    tile.icon.to_string(),
-                    TextStyle {
-                        font: fonts.lucide.clone(),
-                        font_size: 40.0,
-                        color: if i == 0 { OAT_MILK } else { OAT_DIM },
-                    },
-                ),
-                style: Style {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(y - 4.0),
-                    left: Val::Px(130.0),
-                    ..default()
-                },
+            Text::new(tile.icon.to_string()),
+            TextFont {
+                font: fonts.lucide.clone(),
+                font_size: 40.0,
+                ..default()
+            },
+            TextColor(label_color),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(y - 4.0),
+                left: Val::Px(130.0),
                 ..default()
             },
             MenuIcon { index: i },
         ));
 
-        // Label — ALL CAPS Sharp Sans Bold with slight letter-spacing
+        // Label — ALL CAPS Sharp Sans Bold
         commands.spawn((
-            TextBundle {
-                text: Text::from_section(
-                    tile.label,
-                    TextStyle {
-                        font: fonts.bold.clone(),
-                        font_size: 34.0,
-                        color: if i == 0 { OAT_MILK } else { OAT_DIM },
-                    },
-                ),
-                style: Style {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(y),
-                    left: Val::Px(200.0),
-                    ..default()
-                },
+            Text::new(tile.label),
+            TextFont {
+                font: fonts.bold.clone(),
+                font_size: 34.0,
+                ..default()
+            },
+            TextColor(label_color),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(y),
+                left: Val::Px(200.0),
                 ..default()
             },
             MenuLabel { index: i },
@@ -435,18 +367,13 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
     }
 
     // ─── Cursor-driven preview pane (right 2/3) ────────────────────
-    // Stable frame, context-filled (design § 1): the panel is always
-    // there, its contents update with the cursor. Slice 3c step 2 ships
-    // placeholder per-tile content (icon + label + subtitle); Slice 3d
-    // swaps in live data from the daemon's HA polling.
     let (default_icon, default_label, default_subtitle) = preview_for(MENU[0].item);
 
     // Subtle inner-card background to define the pane's region. Bevy
-    // 0.14 has no built-in border_radius for UI nodes (introduced in
-    // 0.15) — square corners for now; rounding can ride on a later
-    // Bevy upgrade per design § 13.13 observation-tuned parameters.
-    commands.spawn(NodeBundle {
-        style: Style {
+    // 0.18 has UI `BorderRadius` now (added 0.15); rounded corners can
+    // be added here in a follow-up if the design wants them.
+    commands.spawn((
+        Node {
             position_type: PositionType::Absolute,
             top: Val::Px(180.0),
             left: Val::Px(540.0),
@@ -454,50 +381,41 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
             height: Val::Px(720.0),
             ..default()
         },
-        background_color: Color::srgba(0.043, 0.071, 0.047, 0.40).into(),
-        border_color: Color::srgba(0.13, 0.18, 0.13, 0.30).into(),
-        ..default()
-    });
+        BackgroundColor(Color::srgba(0.043, 0.071, 0.047, 0.40)),
+        BorderColor::all(Color::srgba(0.13, 0.18, 0.13, 0.30)),
+    ));
 
-    // Preview icon — huge Lucide glyph, single-accent oat-milk
+    // Preview icon — huge Lucide glyph
     commands.spawn((
-        TextBundle {
-            text: Text::from_section(
-                default_icon.to_string(),
-                TextStyle {
-                    font: fonts.lucide.clone(),
-                    font_size: 220.0,
-                    color: OAT_MILK,
-                },
-            ),
-            style: Style {
-                position_type: PositionType::Absolute,
-                top: Val::Px(260.0),
-                left: Val::Px(620.0),
-                ..default()
-            },
+        Text::new(default_icon.to_string()),
+        TextFont {
+            font: fonts.lucide.clone(),
+            font_size: 220.0,
+            ..default()
+        },
+        TextColor(OAT_MILK),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(260.0),
+            left: Val::Px(620.0),
             ..default()
         },
         PreviewElement::Icon,
     ));
 
-    // Preview label — big Sharp Sans Bold ALL-CAPS, oat-milk
+    // Preview label — big Sharp Sans Bold ALL-CAPS
     commands.spawn((
-        TextBundle {
-            text: Text::from_section(
-                default_label,
-                TextStyle {
-                    font: fonts.bold.clone(),
-                    font_size: 92.0,
-                    color: OAT_MILK,
-                },
-            ),
-            style: Style {
-                position_type: PositionType::Absolute,
-                top: Val::Px(290.0),
-                left: Val::Px(890.0),
-                ..default()
-            },
+        Text::new(default_label),
+        TextFont {
+            font: fonts.bold.clone(),
+            font_size: 92.0,
+            ..default()
+        },
+        TextColor(OAT_MILK),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(290.0),
+            left: Val::Px(890.0),
             ..default()
         },
         PreviewElement::Label,
@@ -505,30 +423,23 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
 
     // Preview subtitle — Sharp Sans Semibold, dimmed
     commands.spawn((
-        TextBundle {
-            text: Text::from_section(
-                default_subtitle,
-                TextStyle {
-                    font: fonts.semibold.clone(),
-                    font_size: 32.0,
-                    color: OAT_DIM,
-                },
-            ),
-            style: Style {
-                position_type: PositionType::Absolute,
-                top: Val::Px(410.0),
-                left: Val::Px(890.0),
-                ..default()
-            },
+        Text::new(default_subtitle),
+        TextFont {
+            font: fonts.semibold.clone(),
+            font_size: 32.0,
+            ..default()
+        },
+        TextColor(OAT_DIM),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(410.0),
+            left: Val::Px(890.0),
             ..default()
         },
         PreviewElement::Subtitle,
     ));
 
     // Controller chrome bar — bottom strip, text-only for now.
-    // Formal Xbox-styled colored circle chips deferred (Bevy 0.14 has
-    // no native UI border_radius; rounded chips need either a sprite-
-    // texture approach or a Bevy 0.15 upgrade).
     let chrome_specs = [
         ("A", "SELECT", AMBER_ACCENT),
         ("B", "BACK", OAT_DIM),
@@ -537,61 +448,51 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
     let chrome_y = 1010.0;
     for (i, (button, label, color)) in chrome_specs.iter().enumerate() {
         let x = 120.0 + (i as f32 * 260.0);
-        commands.spawn(TextBundle {
-            text: Text::from_section(
-                button.to_string(),
-                TextStyle {
-                    font: fonts.bold.clone(),
-                    font_size: 26.0,
-                    color: *color,
-                },
-            ),
-            style: Style {
+        commands.spawn((
+            Text::new(button.to_string()),
+            TextFont {
+                font: fonts.bold.clone(),
+                font_size: 26.0,
+                ..default()
+            },
+            TextColor(*color),
+            Node {
                 position_type: PositionType::Absolute,
                 top: Val::Px(chrome_y),
                 left: Val::Px(x),
                 ..default()
             },
-            ..default()
-        });
-        commands.spawn(TextBundle {
-            text: Text::from_section(
-                label.to_string(),
-                TextStyle {
-                    font: fonts.semibold.clone(),
-                    font_size: 18.0,
-                    color: OAT_FAINT,
-                },
-            ),
-            style: Style {
+        ));
+        commands.spawn((
+            Text::new(label.to_string()),
+            TextFont {
+                font: fonts.semibold.clone(),
+                font_size: 18.0,
+                ..default()
+            },
+            TextColor(OAT_FAINT),
+            Node {
                 position_type: PositionType::Absolute,
                 top: Val::Px(chrome_y + 6.0),
                 left: Val::Px(x + 36.0),
                 ..default()
             },
-            ..default()
-        });
+        ));
     }
 
-    // Engine state badge (top-right) — useful for dev iteration to see
-    // the engine in action. May be removed once the preview pane's
-    // content fully signals the engine state contextually.
+    // Engine state badge (top-right)
     commands.spawn((
-        TextBundle {
-            text: Text::from_section(
-                "—",
-                TextStyle {
-                    font: fonts.semibold.clone(),
-                    font_size: 18.0,
-                    color: OAT_FAINT,
-                },
-            ),
-            style: Style {
-                position_type: PositionType::Absolute,
-                top: Val::Px(30.0),
-                right: Val::Px(40.0),
-                ..default()
-            },
+        Text::new("—"),
+        TextFont {
+            font: fonts.semibold.clone(),
+            font_size: 18.0,
+            ..default()
+        },
+        TextColor(OAT_FAINT),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(30.0),
+            right: Val::Px(40.0),
             ..default()
         },
         StateBadge,
@@ -601,8 +502,8 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
 // ─── Systems ─────────────────────────────────────────────────────────
 
 fn gamepad_event_system(
-    mut button_events: EventReader<GamepadButtonChangedEvent>,
-    mut axis_events: EventReader<GamepadAxisChangedEvent>,
+    mut button_events: MessageReader<GamepadButtonChangedEvent>,
+    mut axis_events: MessageReader<GamepadAxisChangedEvent>,
     mut engine_res: ResMut<EngineRes>,
 ) {
     let n = MENU.len();
@@ -610,35 +511,28 @@ fn gamepad_event_system(
 
     for ev in button_events.read() {
         if ev.value <= 0.5 {
-            continue; // edge-trigger on press only
+            continue;
         }
         engine_res.fresh_controller_input = true;
         engine_res.since_input = Duration::ZERO;
-        match ev.button_type {
-            GamepadButtonType::DPadUp => {
+        match ev.button {
+            GamepadButton::DPadUp => {
                 cursor_idx = if cursor_idx == 0 {
                     n - 1
                 } else {
                     cursor_idx - 1
                 };
             }
-            GamepadButtonType::DPadDown => {
+            GamepadButton::DPadDown => {
                 cursor_idx = (cursor_idx + 1) % n;
             }
-            GamepadButtonType::South => {
-                // A — select. Slice 3c step 1 logs only; submenu
-                // launches wire in via the Slice 2 daemon (Slice 3d/3e).
+            GamepadButton::South => {
                 info!("Selected: {:?}", MENU[cursor_idx].item);
             }
-            GamepadButtonType::East => {
-                // B — back. No-op for now; submenu nav stack arrives
-                // when tiles have content beyond the launcher row.
+            GamepadButton::East => {
                 info!("Back");
             }
-            GamepadButtonType::North => {
-                // Y — ALL OFF (engine `Manual::ForceOff`). The engine
-                // makes it sticky; a fresh controller input later
-                // clears it (precedence rule 2).
+            GamepadButton::North => {
                 engine_res.manual_press = Some(Manual::ForceOff);
                 info!("ALL OFF (engine ForceOff)");
             }
@@ -647,7 +541,7 @@ fn gamepad_event_system(
     }
 
     for ev in axis_events.read() {
-        if !matches!(ev.axis_type, GamepadAxisType::LeftStickY) {
+        if !matches!(ev.axis, GamepadAxis::LeftStickY) {
             continue;
         }
         if ev.value.abs() > 0.7 {
@@ -668,13 +562,6 @@ fn gamepad_event_system(
     engine_res.cursor = MENU[cursor_idx].item;
 }
 
-/// Keyboard fallback for dev iteration on the Mac (where the Xbox
-/// controller may not be paired). Mirrors gamepad mappings:
-/// Arrow Up/Down → cursor; Enter/Space → A; Escape → B; Q → Y (ALL OFF).
-/// Any keypress flips the sticky `dev_keyboard_active` flag so the
-/// engine's presence-oracle treats the user as present (otherwise the
-/// engine sits in Off forever, with no Xbox controller wired).
-/// Production Shannon ignores this (no keyboard in the bedroom).
 fn keyboard_event_system(keys: Res<ButtonInput<KeyCode>>, mut engine_res: ResMut<EngineRes>) {
     let n = MENU.len();
     let mut cursor_idx = menu_index_of(engine_res.cursor);
@@ -716,25 +603,18 @@ fn keyboard_event_system(keys: Res<ButtonInput<KeyCode>>, mut engine_res: ResMut
 
 fn engine_tick_system(
     time: Res<Time<Real>>,
-    gamepads: Res<Gamepads>,
+    gamepads: Query<&Gamepad>,
     mut engine_res: ResMut<EngineRes>,
 ) {
-    // Drain pending inputs (mut takes are scoped so the borrow ends
-    // before the engine call).
     let fresh = engine_res.fresh_controller_input;
     let manual_press = engine_res.manual_press.take();
     engine_res.fresh_controller_input = false;
 
     engine_res.since_input += time.delta();
     // Presence oracle: an actual Xbox controller, OR the dev-host
-    // keyboard fallback (sticky, set on first keypress). Production
-    // Shannon never sees the keyboard path; Mac dev iteration relies on
-    // it to demo without an Xbox controller paired to the Mac.
-    let controller_connected = gamepads.iter().count() > 0 || engine_res.dev_keyboard_active;
+    // keyboard fallback (sticky, set on first keypress).
+    let controller_connected = !gamepads.is_empty() || engine_res.dev_keyboard_active;
 
-    // Wall-clock as minutes-since-midnight (local time). Slice 3d may
-    // route this through the daemon for fleet-coherent time; for now,
-    // the dev host's clock is enough.
     let now = current_local_minutes();
 
     let inputs = Inputs {
@@ -750,8 +630,6 @@ fn engine_tick_system(
     let outcome = engine_res.engine.step(&inputs);
     engine_res.state = outcome.state;
 
-    // Apply the predicted cursor ONLY when the user hasn't just acted —
-    // deliberate D-pad nav must dominate the auto-prediction.
     if !fresh {
         let hint = engine_res.engine.hint(&inputs);
         if let Some(predicted) = hint.cursor {
@@ -760,19 +638,12 @@ fn engine_tick_system(
     }
 }
 
-/// Local wall-clock as `ClockMinutes`. Uses chrono-free std::time +
-/// Sweden's standard UTC offset (UTC+1 winter / UTC+2 summer DST handled
-/// by querying the OS for the local time zone in Slice 3d). For dev
-/// iteration today, a coarse hard-coded CEST offset is acceptable — the
-/// engine's hard-off / wind-down windows are observation-tuned anyway.
 fn current_local_minutes() -> ClockMinutes {
     use std::time::{SystemTime, UNIX_EPOCH};
     let utc_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Sweden CEST = UTC+2 (May = summer). Slice 3d wires real
-    // tz-aware conversion via chrono or the daemon's clock.
     const SWEDEN_OFFSET_SECS: u64 = 2 * 60 * 60;
     let local_secs = utc_secs.saturating_add(SWEDEN_OFFSET_SECS);
     let minutes_of_day = ((local_secs / 60) % (24 * 60)) as u16;
@@ -781,8 +652,8 @@ fn current_local_minutes() -> ClockMinutes {
 
 fn menu_render_system(
     engine_res: Res<EngineRes>,
-    mut label_q: Query<(&mut Text, &MenuLabel), Without<MenuIcon>>,
-    mut icon_q: Query<(&mut Text, &MenuIcon), Without<MenuLabel>>,
+    mut label_q: Query<(&mut TextColor, &MenuLabel), Without<MenuIcon>>,
+    mut icon_q: Query<(&mut TextColor, &MenuIcon), Without<MenuLabel>>,
     mut cursor_q: Query<(&mut Visibility, &MenuCursorMarker)>,
 ) {
     if !engine_res.is_changed() {
@@ -790,15 +661,15 @@ fn menu_render_system(
     }
     let selected = menu_index_of(engine_res.cursor);
 
-    for (mut text, label) in label_q.iter_mut() {
-        text.sections[0].style.color = if label.index == selected {
+    for (mut color, label) in label_q.iter_mut() {
+        color.0 = if label.index == selected {
             OAT_MILK
         } else {
             OAT_DIM
         };
     }
-    for (mut text, icon) in icon_q.iter_mut() {
-        text.sections[0].style.color = if icon.index == selected {
+    for (mut color, icon) in icon_q.iter_mut() {
+        color.0 = if icon.index == selected {
             OAT_MILK
         } else {
             OAT_DIM
@@ -824,8 +695,8 @@ fn preview_render_system(engine_res: Res<EngineRes>, mut q: Query<(&mut Text, &P
             PreviewElement::Label => label.to_string(),
             PreviewElement::Subtitle => subtitle.to_string(),
         };
-        if text.sections[0].value != new_value {
-            text.sections[0].value = new_value;
+        if text.0 != new_value {
+            text.0 = new_value;
         }
     }
 }
@@ -840,9 +711,9 @@ fn state_badge_system(engine_res: Res<EngineRes>, mut q: Query<&mut Text, With<S
         DisplayState::Content(_) => "CONTENT",
         DisplayState::Ambient(_) => "AMBIENT",
     };
-    if let Ok(mut text) = q.get_single_mut() {
-        if text.sections[0].value != label {
-            text.sections[0].value = label.to_string();
+    if let Ok(mut text) = q.single_mut() {
+        if text.0 != label {
+            text.0 = label.to_string();
         }
     }
 }
