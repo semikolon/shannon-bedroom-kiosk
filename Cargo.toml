@@ -36,9 +36,16 @@ bevy = { version = "0.18.1", default-features = false, features = [
     # "wayland",           # DISABLED historically; revisit per the x11 note.
     "tonemapping_luts",
     "webgl2",
-    "zstd_rust",          # Bevy 0.18's bevy_image now requires explicit zstd
-                          # backend choice (zstd_rust = pure-Rust, no C compiler
-                          # needed; preferred for cross-compile portability).
+    "jpeg",                # JPEG decoder — required by Slice 3c step 2's
+                           # `sarpetorp-clock-bg.jpg`. Without this, Shannon
+                           # panics on first frame in setup_background.
+                           # Surfaced 2026-05-20; Mac dev never triggered
+                           # before because Slice 3c step 2 never ran on
+                           # Shannon. Adds `image/jpeg` to Bevy's image
+                           # loading stack.
+    "zstd_rust",           # Bevy 0.18's bevy_image now requires explicit zstd
+                           # backend choice (zstd_rust = pure-Rust, no C compiler
+                           # needed; preferred for cross-compile portability).
 ] }
 
 # --- Slice 2: shannon-kiosk-actions daemon ONLY ---
@@ -48,9 +55,31 @@ bevy = { version = "0.18.1", default-features = false, features = [
 # (not OpenSSL) keeps the eventual aarch64 cross-compile clean.
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# --- Bevy 0.18 GL-backend feature enablement (CRITICAL for Shannon) ---
+# 2026-05-21 root-cause finding: bevy_render-0.18.1's wgpu dep is
+# `default-features=false, features=["wgsl","dx12","metal","vulkan",
+# "naga-ir","fragile-send-sync-non-atomic-wasm"]` — `gles` is NOT in
+# the list. Bevy 0.18's top-level `webgl2` feature maps to
+# `wgpu/webgl` (the WASM-target feature), NOT `wgpu/gles` (the native
+# Linux GL backend). Result: without this explicit dep, runtime
+# `Backends::GL` finds NO GL backend compiled in → `request_adapter`
+# returns None in microseconds → "Unable to find a GPU!" panic.
+#
+# Cargo's feature-unification means adding wgpu as a direct dep with
+# `gles` activates it on bevy_render's wgpu dep too. Mac (Metal) is
+# unaffected — bevy_render's `metal` feature handles that path.
+wgpu = { version = "27", default-features = false, features = ["gles", "wgsl"] }
+
+# zune-core only ships 0.5.0-rcN on crates.io (no stable 0.5.0). The
+# `jpeg` feature → `zune-jpeg` → `zune-core ^0.5.0` would fail to
+# resolve without this prerelease opt-in. Pinning to rc2 (the latest
+# known-good). Without this, `cargo build` errors out with "candidate
+# versions found which didn't match" for zune-core.
+zune-core = "=0.5.0-rc2"
 
 # Performance profile for release — Bevy is heavy without optimizations
 [profile.release]
