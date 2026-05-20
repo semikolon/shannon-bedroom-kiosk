@@ -71,7 +71,44 @@ Bevy `WgpuSettings::priority=WebGL2` + custom limits keep us in the GLES 3.0/Web
 
 **Phase 2 retro UI rendered visually** on the bedroom monitor — amber-on-black "SHANNON" title + 5-item menu (GAMES / MEDIA / LIGHTS / SENSORS / SLEEP) with Press Start 2P pixel font. User confirmed visible briefly before each freeze.
 
-### ✅ May 17, 2026 — PHASE 2 VALIDATED (watchdog-confound proven by experiment; BLOCKER below is SUPERSEDED)
+### 🟥→🟢 May 20, 2026 — HARDWARE-STABILITY ROOT-CAUSE + freq-cap MITIGATION (supersedes the May-17 "PHASE 2 VALIDATED" below)
+
+**Kiosk-with-controller live test ran 2026-05-20** (on the dev ultrawide monitor at desk; bedroom TV move deferred). **Six kiosk launches across full + minimal Bevy, Mesa 25.0.7 + 25.2.6, HA-stopped + HA-running, controller-pressed + controller-untouched** — ALL wedged in 7-45 s. Repeated the May-13 "BLOCKER" pattern that May-17 was thought to have refuted. **Refutation of "GPU-driver" framing**: `stress-ng --cpu 6 --vm 2` with **no GPU activity** ALSO wedged Shannon in <60 s. Mesa 25.2.6 upgrade tested → wedged identically (no menu visible before wedge — possibly faster wedge with newer Mesa, possibly stochastic).
+
+**Root cause** (working hypothesis from this session's data; physical confirmation pending): **SoC misbehaves at peak frequencies under sustained heavy load**. Likely contributors:
+- **PMIC droop**: RK808 voltage regulation under peak current (A72 @ 2.016 GHz draws 1.075 V; sustained 6-core load may exceed regulation envelope)
+- **Passive cooling marginal**: at A72 = 1.608 GHz cap temp hit 88 °C in 2 min (past CPU passive throttle 85 °C) — die temp likely higher than sensor reads
+- **Possibly undersized PSU** (Tuya plug → USB-C wall wart of unknown rating)
+- Signal: **PSI irq full ≈ 0.94 even at idle** suggests marginal baseline that any added load pushes over
+
+**Test matrix that converged on the fix**:
+
+| Config (max freqs) | Stress-ng survival | Kiosk-minimal survival |
+|---|---|---|
+| A53=1.512 / A72=2.016 / GPU=800 (rated max) | wedge in <60 s | wedge in 7-45 s |
+| A53=1.512 / A72=**1.608** / GPU=800 | wedge at ~2 min @ 88 °C | n/a |
+| A53=**1.008** / A72=**1.008** / GPU=**400** | **3 min clean @ 69 °C peak** | **5+ min stable @ 65-67 °C steady** |
+
+**Mitigation DEPLOYED + ENABLED at boot**: `shannon-freq-caps.service` (oneshot, `multi-user.target`, before docker + shannon-display). Sourced from SSoT at `~/dotfiles/system/shannon/usr/local/sbin/shannon-apply-freq-caps` + `~/dotfiles/system/shannon/etc/systemd/system/shannon-freq-caps.service`. Caps survive reboot via systemd. Net cost: ~50% peak performance for IoT-hub + kiosk stability.
+
+**Hardware-side improvements still open** (physical access needed, none blocking):
+- Verify wall-wart PSU rating vs RK3399 peak demand (~3 A @ 5 V)
+- Clip-on 30 mm fan over the heatsink (~$5 USB-powered)
+- Inspect thermal compound under existing heatsink (may be dried)
+- Larger heatsink
+
+**Implications**:
+- The **`Workload policy — DO NOT BUILD ON SHANNON`** rule below was forged for the **SD-rootfs era**; Demeter USB rootfs is fine for apt installs and Rust compiles (heavy-write policy lifted by user 2026-05-20). The constraint that NOW matters is **peak frequency under sustained load** — cross-compilation is still a workload-throughput win but no longer a stability necessity. Update accordingly when next iterating that policy.
+- **Phase 2** is no longer "VALIDATED at full freq" — it's "stable under freq caps". Use the freq-cap config as the baseline for Phase 3 work.
+- **`systemctl enable shannon-display.service`** is now a smaller risk under caps. Still want a 1+ hour stability soak before flipping it on, but the wedge mode is mitigated.
+- **Slice 4 (patched mpv `--hwdec=drm` 1080p H.264)** needs explicit validation at GPU=400 MHz cap. If decode requires more GPU headroom, the higher-sustainable-freq search (1.2 / 1.416 GHz candidates) becomes a Slice-4 prerequisite.
+
+**Forensic tooling forged this session** (reusable for future wedge investigations):
+- `fb0-capture` (Shannon-side `/usr/local/sbin/fb0-capture`) — atomic `dd /dev/fb0` to SD-shadow + sidecar `.meta`; survives wedge via `/var/log.hdd` + sync
+- `fb0-convert` (Mac-side `~/.local/bin/fb0-convert`) — BGRA8888 → PNG via Pillow; reads sidecar or filename-encoded dims
+- `shannon-gpu-telemetry` extended to dump `/proc/interrupts` per-snapshot (10s cadence) — survives wedge via SD-shadow + sync; captures pre-wedge IRQ rates for post-hoc delta analysis
+
+### ✅ May 17, 2026 — PHASE 2 VALIDATED (watchdog-confound proven by experiment; BLOCKER below is SUPERSEDED) — *2026-05-20 caveat: this "VALIDATED" verdict was UPHELD for short runs but OVERTURNED at length. The watchdog confound was real; the kiosk wedge has additional causes that May-17's 5-6 min sample size couldn't detect. See the May-20 section above.*
 
 **Confound-free bifurcation re-test EXECUTED May 17 ~23:00 CEST → the BLOCKER writeup below is RESOLVED.** With both confounds removed (watchdog observability-only + Demeter USB rootfs), the *exact* May-13 binaries ran rock-stable: minimal Bevy core **6+ min**, full Phase-2 retro menu **5+ min** — uptime monotonic (no reboot), PSI cpu/io ~0.00, `SYSRQ FIRED`=0, HA=200 throughout, Mali-T860 Panfrost adapter clean. The "deep-wedges in 19-27 s, 4+ times" blocker was the `shannon-watchdog` SYSRQ footgun (triple-checked → proven twice). The genuine-Mali residual is **refuted by experiment**. **The escalation ladder (SDL2 / kernel-6.12 / Mesa-25.3.2 / drop-cage / vendor-blob) is MOOTED — do NOT execute it.** Bevy 0.14 + vendored wgpu-hal-0.21.1-mali-fix + cage + Mesa-Panfrost-25.0.7 is viable as-is. Only residue: a ≥1 h soak before `systemctl enable shannon-display.service`. Canonical record: `~/dotfiles/docs/shannon_bedroom_kiosk_plan_2026_05_06.md` Implementation log "May 17 ~23:00 — bifurcation test EXECUTED".
 
