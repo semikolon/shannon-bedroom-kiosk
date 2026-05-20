@@ -21,11 +21,19 @@ rsync -av --exclude='target/' --exclude='.git/' \
   ~/Projects/shannon-bedroom-kiosk/ \
   darwin:~/shannon-kiosk-build/shannon-bedroom-kiosk/
 
-# 2. Cross-compile (~3m41s first build, ~1m23s incremental)
+# 2. Cross-compile (master Bevy 0.14: ~3-5m first build, ~1-2m incremental;
+#    bevy-upgrade Bevy 0.18: ~10-15m first, ~3-5m incremental due to
+#    larger dep tree)
 ssh darwin "cd ~/shannon-kiosk-build/shannon-bedroom-kiosk && \
   PKG_CONFIG_ALLOW_CROSS=1 ~/.cargo/bin/cross build \
     --target aarch64-unknown-linux-gnu --release \
-    --config build.rustc-wrapper='\"\"'"
+    --bin shannon-kiosk"
+
+# NOTE 2026-05-20: dropped the documented `--config build.rustc-wrapper='""'`
+# override. Darwin's ~/.cargo/config.toml intentionally does NOT set
+# build.rustc-wrapper as Cargo config — sccache is provided via RUSTC_WRAPPER
+# env var only (host env not forwarded into cross-rs's Docker container,
+# which lacks sccache). The override broke cargo's TOML parse on Darwin.
 ```
 
 **Deploy to Shannon** (always sync after — `commit=120` ext4 mount loses /etc edits across freezes):
@@ -118,7 +126,23 @@ Bevy `WgpuSettings::priority=WebGL2` + custom limits keep us in the GLES 3.0/Web
 - `94ff1fd` Slice 3c step 1 — drop pixelated; Sarpetorp forest palette + Sharp Sans + Lucide + 6-tile menu + engine integration + Y=ForceOff
 - `5117b82` Slice 3c step 2 — bg image cover-fit at 20% + cursor-driven preview pane (huge Lucide icon + big label + dim subtitle per tile)
 
-**Deferred (next steps)**: 3c step 3 (formal Xbox chips — Bevy 0.14 has no UI `border_radius`); 3d (daemon HA polling); 3e (ribbon-offer wiring); 3f (`BlackoutTvPower` + `HdmiSignalTvPower`); 3g (Ambient + Off scene roots).
+### 🎉 May 21, 2026 — Slices 3d-3g SHIPPED + LIVE-VERIFIED on Shannon
+
+4 commits adding the daemon HA polling + Bevy ribbon-offer wiring + BlackoutTvPower + Ambient/Off scene roots, plus a Shannon-side fix commit:
+
+- `01b257f` Slice 3d — daemon HA polling: new `src/ha_poll.rs` (pure module, 10 tests) + `shannon-kiosk-actions` background tokio polling task + `GET /ha-state` endpoint. Polls `media_player.fredriks_tv` every `HA_POLL_INTERVAL_SECS` (default 30s) with exponential backoff up to 5min on failure.
+- `10d8da8` Slice 3e — ribbon-offer wiring: `Engine::hint_with_offer(&Inputs, Option<&str>)` engine API with confidence gates (6 tests). Bevy `std::thread` reqwest::blocking poller hits daemon's `/ha-state` every `HA_POLL_INTERVAL_SECS` (default 3s on Bevy side). Shared `Arc<Mutex<HaSnapshot>>` consumed in `engine_tick_system` via `try_lock` (non-blocking). New `RibbonLabel` UI element + `ribbon_render_system`. `Media` derives `Default`. Cargo: `reqwest blocking` feature.
+- `bb77d38` Slice 3f — `BlackoutTvPower` actuator (drop-in TvPower impl, 4 tests) + `BlackoutOverlay` full-screen black NodeBundle at `ZIndex::Global(500)` + `blackout_render_system`. Preserves Argon DA2 keepalive (no HDMI signal cut).
+- `27e2f23` Slice 3g — Ambient + Off scene roots: `AmbientCanvas` z=300 full-screen amber × engine brightness + `ambient_render_system`. Off scene reuses 3f blackout (engine `SetTvPower(false)` flips it on transition).
+- `0e42b67` Shannon-side panic fixes: `jpeg` Bevy feature + `zune-core = "=0.5.0-rc2"` pin (no stable 0.5.0 on crates.io) + bg JPG resized 3320×5299 → 2506×4000 to fit Mali's 4096 texture-dimension limit.
+
+**Live-verified 2026-05-21 ~23:48 CEST** on Shannon: cross-compile (3m15s, 31.5 MB binary) → scp deploy → 75s soak: `AdapterInfo { name: "Mali-T860 (Panfrost)", driver_info: "OpenGL ES 3.1 Mesa 25.0.7-2", backend: Gl }` ✓, `systemctl is-active = active`, load 0.17, CPU 45.6°C, zero panics. fb0-capture confirmed correct blackout rendering for engine's initial Off state. **62 tests total** (was 32 at session start), all green.
+
+**Daemon not yet deployed**: `shannon-kiosk-actions` binary built + tested on Mac, NOT deployed to Shannon — gated on Fredrik's HA_TOKEN + entity_id config. Bevy poller silently retries connection-refused until daemon ships.
+
+**STILL DEFERRED (cosmetic only)**: Slice 3c step 3 (formal Xbox-styled colored circle chips for A/B/Y) — blocked on Bevy 0.14 lacking UI `border_radius`. The `bevy-upgrade` branch (Bevy 0.18.1) NOW unblocks this — see §"Bevy version" below.
+
+Full Slice 3d-3g arc: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` § 13.23.
 
 **Try it locally**: `cd ~/Projects/shannon-bedroom-kiosk && cargo run --bin shannon-kiosk`. With an Xbox controller paired over BT: D-pad / left stick to navigate, A select, B back, Y all-off. Without controller: the menu still renders (engine reports Off but menu UI is always-spawned at startup); a keyboard fallback for dev-without-Xbox is a candidate follow-up.
 
@@ -213,6 +237,12 @@ Outstanding Phase 2 design choices (NOT blocking — easy to tweak):
 
 ## Bevy version
 
-Currently Bevy 0.14 (wgpu 0.20). If wgpu's Mali GLES `BadMatch` issue gets fixed in a future Bevy/wgpu release, that may unblock HW-accelerated path on Shannon (would let us drop the `WinitSettings::desktop_app()` reactive constraint and run smoother). Not blocking for Phase 2-3.
+**master = Bevy 0.14 (wgpu 0.20)** — production-stable on Shannon, Slices 3a-3g all SHIPPED + LIVE-VERIFIED. Uses vendored `wgpu-hal-0.21.1-mali-fix` (4 patches) + `jpeg` Bevy feature + `zune-core = "=0.5.0-rc2"` pin + 2506×4000 bg jpg to fit Mali 4096 texture limit.
+
+**`bevy-upgrade` branch = Bevy 0.18.1 (wgpu 27.0.1)** — **LIVE-VERIFIED on Shannon Mali HW-GLES 2026-05-21**. 5+ min steady-state soak. Root cause of the night's blocker was a missing wgpu `gles` feature flag: `bevy_render-0.18.1`'s wgpu dep is `default-features=false, features=["wgsl","dx12","metal","vulkan","naga-ir","fragile-send-sync-non-atomic-wasm"]` — `gles` NOT in list, so the GL backend wasn't compiled in. Bevy's top-level `webgl2` feature maps to `wgpu/webgl` (WASM-only), NOT `wgpu/gles` (native Linux). Fix: direct `wgpu = { version = "27", default-features = false, features = ["gles", "wgsl"] }` dep in `Cargo.toml`; Cargo's feature-unification activates `gles` on bevy_render's wgpu dep transitively. Three wgpu-hal vendor patches (X11 Wayland-veto + force_gles bind_api + robustness retry incl. BadParameter) kept as defense-in-depth in `vendored/wgpu-hal-27.0.4-mali-fix/`.
+
+**Merge recommendation**: when convenient, merge `bevy-upgrade` → master. Unblocks Slice 3c step 3 (formal Xbox-styled chips via Bevy 0.15+ UI `border_radius`), brings ECS perf improvements + cosmic-text Unicode + modern gamepad event API.
+
+Full Bevy-upgrade arc: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` §§ 13.16-13.25 + verbatim subagent research at `~/dotfiles/docs/shannon_kiosk_bevy_upgrade_mali_research_2026_05_20.md` + generalizable insight mirrored to `~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md` § H.
 
 If we hit Bevy resource-use ceilings on Shannon, fallback per kiosk plan § "Why Bevy specifically" is `egui + winit` — lighter, but more glue work for retro shaders.
