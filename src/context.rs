@@ -219,6 +219,56 @@ pub struct StepOutcome {
     pub actions: Vec<Action>,
 }
 
+/// A menu tile in the Kiosk-state retro menu (Slice 3 visual layer).
+/// The canonical six per design § 13.1: Sleep replaces the original
+/// design-doc Settings (Sleep paired with engine `ForceOff` is more
+/// useful at the moment of interaction than a meta-config tile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MenuItem {
+    Games,
+    Music,
+    Lights,
+    Watch,
+    Sensors,
+    Sleep,
+}
+
+impl MenuItem {
+    /// Slice-3 cursor fallback when the engine emits no confident
+    /// prediction. Per Vision: *"most often watch something."* Renderer
+    /// uses this whenever `KioskHint::cursor == None`.
+    #[must_use]
+    pub const fn default_fallback() -> Self {
+        Self::Watch
+    }
+}
+
+/// Single-line content offer for the Kiosk-state ribbon. `text` is the
+/// user-facing string the renderer paints (e.g. *Resume "The Boys"
+/// S04E01*). The action surface (what pressing `[A]` does) is wired in
+/// a later sub-slice (3e) once the daemon polls last-watched media
+/// state. Slice 3a ships the type; offers remain `None` until then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RibbonOffer {
+    pub text: String,
+}
+
+/// What to render in the Kiosk state beyond just "show the menu" — the
+/// engine's two small Kiosk-state outputs per design § 1 ("stable frame,
+/// context-filled"). Renderer reads it only when in Kiosk state;
+/// computing it in other states is harmless (cheap pure function).
+///
+/// `cursor == None` ⇒ no confident prediction; renderer falls back to
+/// `MenuItem::default_fallback()` (= Watch).
+/// `ribbon == None` ⇒ silent ribbon. An empty ribbon never trains
+/// distrust; a weak guess shown anyway does (design § 1: "confident or
+/// quiet, never noisy").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KioskHint {
+    pub cursor: Option<MenuItem>,
+    pub ribbon: Option<RibbonOffer>,
+}
+
 /// The TV power port. Slice 1 ships `SimTvPower`; the real
 /// `HaSmartPlugTvPower` (HA REST) is a Slice-2 adapter — same trait.
 pub trait TvPower {
@@ -360,6 +410,54 @@ impl Engine {
             state: next,
             actions,
         }
+    }
+
+    /// Predict cursor start tile + ribbon offer for the Kiosk state.
+    /// Pure function of `Inputs` + `Config`. Emit `None` whenever not
+    /// confident (design § 1: *"confident or quiet, never noisy"*).
+    /// Does NOT mutate engine state — safe to call freely each tick.
+    #[must_use]
+    pub fn hint(&self, i: &Inputs) -> KioskHint {
+        KioskHint {
+            cursor: self.predict_cursor(i),
+            // Ribbon offers wire in once the daemon polls last-watched
+            // media (Slice 3e). Until then: stay silent — no false
+            // confidence (design § 1 again).
+            ribbon: None,
+        }
+    }
+
+    /// Time-of-day + media driven cursor prediction. Initial heuristic;
+    /// thresholds are observation-tunable (Architecture-vs-parameters:
+    /// the levers exist; the values are not yet measured-from-use).
+    fn predict_cursor(&self, i: &Inputs) -> Option<MenuItem> {
+        let cfg = &self.cfg;
+        // Hard-off window: Sleep is the obvious tile (room is winding
+        // down; mirrors the bedroom-lights hard-off floor).
+        if cfg.is_hard_off(i.now) {
+            return Some(MenuItem::Sleep);
+        }
+        // Music playing: Music tile (cursor lands on what's active;
+        // likely the user wants to adjust the currently-playing track).
+        if matches!(i.media, Media::Music) {
+            return Some(MenuItem::Music);
+        }
+        // Evening wind-down: Watch (Vision: *"most often watch
+        // something"*).
+        if cfg.is_winddown(i.now) {
+            return Some(MenuItem::Watch);
+        }
+        // Morning daylight (07:00–11:00 default — the 4 h window after
+        // the hard-off floor ends): Lights (greet the room;
+        // lights-before-games per delight-per-effort roadmap § 7).
+        let morning_start = cfg.hard_off_end.raw();
+        let morning_end = morning_start.saturating_add(4 * 60);
+        if (morning_start..morning_end).contains(&i.now.raw()) {
+            return Some(MenuItem::Lights);
+        }
+        // Otherwise: no confident prediction → renderer falls back to
+        // `MenuItem::default_fallback()` (= Watch).
+        None
     }
 }
 
@@ -564,5 +662,136 @@ mod tests {
     fn clock_minutes_wrap_and_raw() {
         assert_eq!(ClockMinutes::at(25, 0).raw(), 60);
         assert_eq!(ClockMinutes::at(23, 59).raw(), 23 * 60 + 59);
+    }
+
+    // ─── Slice 3a: KioskHint cursor + ribbon prediction ──────────────
+
+    #[test]
+    fn hint_hard_off_predicts_sleep() {
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(3, 0); // 00:00–07:00 hard-off
+        let h = e.hint(&i);
+        assert_eq!(h.cursor, Some(MenuItem::Sleep));
+        assert_eq!(h.ribbon, None); // ribbon silent until Slice 3e wires media polling
+    }
+
+    #[test]
+    fn hint_music_playing_predicts_music() {
+        let e = eng();
+        let mut i = base();
+        i.media = Media::Music;
+        i.now = ClockMinutes::at(15, 0); // midday, music plays
+        assert_eq!(e.hint(&i).cursor, Some(MenuItem::Music));
+    }
+
+    #[test]
+    fn hint_winddown_predicts_watch_per_vision() {
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(22, 30); // ≥22:00 wind-down
+        assert_eq!(e.hint(&i).cursor, Some(MenuItem::Watch));
+    }
+
+    #[test]
+    fn hint_morning_predicts_lights() {
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(8, 0); // 07:00–11:00 morning window
+        assert_eq!(e.hint(&i).cursor, Some(MenuItem::Lights));
+    }
+
+    #[test]
+    fn hint_midday_default_is_none_renderer_falls_back_to_watch() {
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(14, 0); // midday: no confident prediction
+        assert_eq!(e.hint(&i).cursor, None);
+        // Renderer fallback (asserted at the type level, not by the engine).
+        assert_eq!(MenuItem::default_fallback(), MenuItem::Watch);
+    }
+
+    #[test]
+    fn hint_precedence_hard_off_beats_music() {
+        // Music inside the hard-off window: Sleep still wins. The room is
+        // winding down; music doesn't override the floor.
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(3, 0);
+        i.media = Media::Music;
+        assert_eq!(e.hint(&i).cursor, Some(MenuItem::Sleep));
+    }
+
+    #[test]
+    fn hint_precedence_music_beats_winddown_window() {
+        // Music inside wind-down: Music wins. Active intent supersedes
+        // time-of-day default.
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(22, 30);
+        i.media = Media::Music;
+        assert_eq!(e.hint(&i).cursor, Some(MenuItem::Music));
+    }
+
+    #[test]
+    fn hint_ribbon_silent_across_all_inputs_until_slice_3e() {
+        // Slice 3a stub: ribbon stays None unconditionally. Slice 3e
+        // will add resume-last-watched via HA media_player.fredriks_tv.
+        let e = eng();
+        for hour in 0..24u16 {
+            let mut i = base();
+            i.now = ClockMinutes::at(hour, 0);
+            for media in [Media::None, Media::Music, Media::Video, Media::Game] {
+                i.media = media;
+                assert_eq!(
+                    e.hint(&i).ribbon,
+                    None,
+                    "ribbon must stay silent at hour={hour} media={media:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hint_is_pure_no_state_mutation_idempotent() {
+        // hint() must NOT mutate self.state or self.manual; calling it
+        // many times with the same inputs returns equal results. The
+        // engine is intentionally NOT bound `mut` here: hint() takes
+        // `&self`, so any need for `mut` would be a regression.
+        let e = eng();
+        let i = base();
+        let state_before = e.state();
+        let _ = e.hint(&i);
+        let _ = e.hint(&i);
+        let _ = e.hint(&i);
+        assert_eq!(e.state(), state_before);
+        assert_eq!(e.hint(&i), e.hint(&i));
+    }
+
+    #[test]
+    fn hint_boundary_at_winddown_start_exactly_2200() {
+        // is_winddown is inclusive of 22:00 (the >= comparison in Config).
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(22, 0);
+        assert_eq!(e.hint(&i).cursor, Some(MenuItem::Watch));
+    }
+
+    #[test]
+    fn hint_boundary_at_morning_start_exactly_0700() {
+        // hard_off_end = 07:00; (07:00..11:00) contains 07:00 → Lights.
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(7, 0);
+        assert_eq!(e.hint(&i).cursor, Some(MenuItem::Lights));
+    }
+
+    #[test]
+    fn hint_boundary_at_morning_end_exactly_1100_is_none() {
+        // Morning end is exclusive (11:00 ∉ [07:00, 11:00)) → None midday.
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(11, 0);
+        assert_eq!(e.hint(&i).cursor, None);
     }
 }
