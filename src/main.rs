@@ -283,6 +283,13 @@ struct RibbonLabel;
 #[derive(Component)]
 struct BlackoutOverlay;
 
+/// Marker for the Ambient scene root (Slice 3g). Full-screen amber
+/// canvas modulated by the engine's adaptive-dim brightness (design
+/// § 5: outdoor-solar-curve × time-of-day, monotonic + bounded).
+/// Visible only when DisplayState::Ambient(_); hidden otherwise.
+#[derive(Component)]
+struct AmbientCanvas;
+
 /// Marker for the three preview-pane text spawns; lets one query update
 /// all of them via `match` on the variant. Single-component-with-variant
 /// keeps the system signature simple (clippy-friendly) vs three
@@ -392,6 +399,7 @@ fn main() {
                 menu_render_system,
                 preview_render_system,
                 ribbon_render_system,
+                ambient_render_system,
                 blackout_render_system,
                 state_badge_system,
             ),
@@ -697,6 +705,28 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
             ..default()
         },
         RibbonLabel,
+    ));
+
+    // Full-screen Ambient canvas (Slice 3g). Below the blackout
+    // overlay (z=300) so Off state still blacks-out over Ambient.
+    // Color is set per-tick by ambient_render_system to amber × engine
+    // brightness; spawned at full amber so first paint isn't a flash.
+    commands.spawn((
+        NodeBundle {
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Px(0.0),
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                bottom: Val::Px(0.0),
+                ..default()
+            },
+            background_color: AMBER_ACCENT.into(),
+            visibility: Visibility::Hidden, // engine flips on Ambient state
+            z_index: ZIndex::Global(300),
+            ..default()
+        },
+        AmbientCanvas,
     ));
 
     // Full-screen blackout overlay (Slice 3f). Spawned BEFORE the
@@ -1135,6 +1165,35 @@ fn ribbon_render_system(
             *vis = Visibility::Inherited;
         }
         None => {
+            *vis = Visibility::Hidden;
+        }
+    }
+}
+
+/// Slice 3g: render the Ambient scene — a full-screen amber canvas
+/// modulated by the engine's adaptive-dim brightness. Visible only
+/// when DisplayState::Ambient(b); color = AMBER_ACCENT × b.
+fn ambient_render_system(
+    engine_res: Res<EngineRes>,
+    mut q: Query<(&mut Visibility, &mut BackgroundColor), With<AmbientCanvas>>,
+) {
+    if !engine_res.is_changed() {
+        return;
+    }
+    let Ok((mut vis, mut bg)) = q.get_single_mut() else {
+        return;
+    };
+    match engine_res.state {
+        DisplayState::Ambient(brightness) => {
+            *vis = Visibility::Visible;
+            let b = brightness.get();
+            // Amber AMBER_ACCENT = (0.94, 0.71, 0.18). Scaling RGB by
+            // brightness keeps the hue and dims toward black. Alpha
+            // stays 1.0 (full occlusion — Ambient is its own scene,
+            // not an overlay on the kiosk menu).
+            *bg = Color::srgb(0.94 * b, 0.71 * b, 0.18 * b).into();
+        }
+        _ => {
             *vis = Visibility::Hidden;
         }
     }
