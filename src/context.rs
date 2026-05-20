@@ -83,8 +83,9 @@ impl DisplayState {
 }
 
 /// What audio/video is currently playing (the engine's content signal).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Media {
+    #[default]
     None,
     Music,
     Video,
@@ -416,15 +417,57 @@ impl Engine {
     /// Pure function of `Inputs` + `Config`. Emit `None` whenever not
     /// confident (design § 1: *"confident or quiet, never noisy"*).
     /// Does NOT mutate engine state — safe to call freely each tick.
+    ///
+    /// Use [`Engine::hint_with_offer`] when the host has a candidate
+    /// resume title from the HA media-player poll (Slice 3e).
     #[must_use]
     pub fn hint(&self, i: &Inputs) -> KioskHint {
+        self.hint_with_offer(i, None)
+    }
+
+    /// Same as [`Engine::hint`] but takes an optional candidate resume
+    /// title from outside (Slice 3e: the daemon polls `media_player.
+    /// fredriks_tv` and forwards its `media_title` when state is
+    /// `paused`/`idle`). The engine still gates confidence — the
+    /// ribbon only surfaces when:
+    ///   1. A title is supplied (caller's HA data has something to resume)
+    ///   2. The host signals no fresh user input recently (cursor-prediction
+    ///      precondition — same gate as cursor: respect deliberate nav)
+    ///   3. Outside the hard-off window (resume offers when the room is
+    ///      winding down for sleep would be noise)
+    ///
+    /// Conditions 2-3 are deliberately conservative — design § 1's
+    /// *"confident-or-quiet"* discipline. The renderer treats `None`
+    /// as "leave the ribbon line blank/dim, no `[A]` chip" so the
+    /// silent state never trains distrust.
+    #[must_use]
+    pub fn hint_with_offer(&self, i: &Inputs, resumable_title: Option<&str>) -> KioskHint {
         KioskHint {
             cursor: self.predict_cursor(i),
-            // Ribbon offers wire in once the daemon polls last-watched
-            // media (Slice 3e). Until then: stay silent — no false
-            // confidence (design § 1 again).
-            ribbon: None,
+            ribbon: self.compute_ribbon(i, resumable_title),
         }
+    }
+
+    /// Compute the ribbon offer per the hint_with_offer doc-comment
+    /// gates. Pure helper; tested directly.
+    fn compute_ribbon(&self, i: &Inputs, resumable_title: Option<&str>) -> Option<RibbonOffer> {
+        let title = resumable_title?.trim();
+        if title.is_empty() {
+            return None;
+        }
+        // Hard-off window: room is winding down — no resume offer
+        // (sleep nudge by gentle absence, design § 7).
+        if self.cfg.is_hard_off(i.now) {
+            return None;
+        }
+        // Fresh user input: they're actively navigating; don't paper
+        // over with an unrelated offer. Re-emit on the next idle tick.
+        if i.fresh_controller_input {
+            return None;
+        }
+        Some(RibbonOffer {
+            text: format!("Resume {title}"),
+        })
     }
 
     /// Time-of-day + media driven cursor prediction. Initial heuristic;
@@ -734,9 +777,11 @@ mod tests {
     }
 
     #[test]
-    fn hint_ribbon_silent_across_all_inputs_until_slice_3e() {
-        // Slice 3a stub: ribbon stays None unconditionally. Slice 3e
-        // will add resume-last-watched via HA media_player.fredriks_tv.
+    fn hint_ribbon_silent_when_no_resumable_title_from_host() {
+        // Without a host-supplied resume title (Slice 3e: from HA poll),
+        // ribbon stays silent across the entire (hour × media) matrix.
+        // The engine never invents content — it only gates an offer
+        // when the host has something concrete.
         let e = eng();
         for hour in 0..24u16 {
             let mut i = base();
@@ -746,10 +791,107 @@ mod tests {
                 assert_eq!(
                     e.hint(&i).ribbon,
                     None,
-                    "ribbon must stay silent at hour={hour} media={media:?}"
+                    "ribbon must stay silent (no title) at hour={hour} media={media:?}"
+                );
+                // hint_with_offer(None) is the same as hint() — invariant.
+                assert_eq!(
+                    e.hint_with_offer(&i, None).ribbon,
+                    None,
+                    "hint_with_offer(None) silent at hour={hour} media={media:?}"
                 );
             }
         }
+    }
+
+    // ─── Slice 3e: ribbon offer wiring (resume-last-watched from HA) ────
+
+    #[test]
+    fn ribbon_emits_resume_offer_when_title_supplied_and_idle() {
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(15, 0); // midday — outside hard-off
+        i.fresh_controller_input = false; // user not actively navigating
+        let h = e.hint_with_offer(&i, Some("The Boys S04E01"));
+        assert_eq!(
+            h.ribbon,
+            Some(RibbonOffer {
+                text: "Resume The Boys S04E01".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn ribbon_silent_during_fresh_user_input() {
+        // User pressing buttons right now = they have intent. Don't
+        // paper over with an offer. Next idle tick can re-offer.
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(15, 0);
+        i.fresh_controller_input = true;
+        assert_eq!(
+            e.hint_with_offer(&i, Some("Some Movie")).ribbon,
+            None,
+            "fresh user input must suppress ribbon"
+        );
+    }
+
+    #[test]
+    fn ribbon_silent_during_hard_off_window() {
+        // Inside the 00:00–07:00 hard-off floor, resume offers would
+        // contradict the sleep-encouragement-by-gentle-absence guardrail.
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(3, 0); // post-midnight
+        i.fresh_controller_input = false;
+        assert_eq!(
+            e.hint_with_offer(&i, Some("Some Movie")).ribbon,
+            None,
+            "ribbon must stay silent during hard-off window"
+        );
+    }
+
+    #[test]
+    fn ribbon_silent_for_whitespace_only_title() {
+        // Defensive: HA can return whitespace-only `media_title` for
+        // some apps before/between media. Treat as no offer.
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(15, 0);
+        i.fresh_controller_input = false;
+        assert_eq!(e.hint_with_offer(&i, Some("   ")).ribbon, None);
+        assert_eq!(e.hint_with_offer(&i, Some("")).ribbon, None);
+    }
+
+    #[test]
+    fn ribbon_offer_text_trims_title_whitespace() {
+        // HA can return "  My Show   " with stray spaces from poorly
+        // tagged media. Normalize on the way out.
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(15, 0);
+        i.fresh_controller_input = false;
+        assert_eq!(
+            e.hint_with_offer(&i, Some("  My Show   ")).ribbon,
+            Some(RibbonOffer {
+                text: "Resume My Show".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn ribbon_is_pure_no_state_mutation() {
+        // hint_with_offer must not mutate engine state — call it many
+        // times with the same inputs and same title; result is stable.
+        let e = eng();
+        let mut i = base();
+        i.now = ClockMinutes::at(15, 0);
+        i.fresh_controller_input = false;
+        let title = "Show X";
+        let h1 = e.hint_with_offer(&i, Some(title));
+        let h2 = e.hint_with_offer(&i, Some(title));
+        let h3 = e.hint_with_offer(&i, Some(title));
+        assert_eq!(h1, h2);
+        assert_eq!(h2, h3);
     }
 
     #[test]

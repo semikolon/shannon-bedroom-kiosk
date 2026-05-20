@@ -58,6 +58,7 @@ use bevy::winit::WinitSettings;
 use shannon_kiosk::context::{
     ClockMinutes, Config, DisplayState, Engine, Inputs, Manual, Media, MenuItem,
 };
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // ─── Sarpetorp forest palette (mirrors the dashboard) ────────────────
@@ -172,9 +173,37 @@ struct EngineRes {
     // this (no keyboard is wired). Set true permanently on the first
     // keyboard event; reset never (a dev session implies presence).
     dev_keyboard_active: bool,
-    // Placeholders for Slice 3d (daemon HA polling):
+    // Slice 3d/3e — populated by the HA-state poller thread from the
+    // shannon-kiosk-actions daemon's /ha-state endpoint. media drives
+    // the engine's Content/Ambient precedence; ha_ribbon_title supplies
+    // the resume-last-watched ribbon offer text; ha_occupancy is a
+    // future presence signal (currently unused by the engine — Slice
+    // 3e wires it into the controller-BT oracle as a supplementary
+    // signal when bedroom_occupancy is configured in HA).
     media: Media,
     outdoor_brightness: f32,
+    ha_ribbon_title: Option<String>,
+    ha_occupancy: bool,
+    /// Shared snapshot read on every Bevy tick. None until first
+    /// successful poll (daemon down on dev iteration). Mac dev runs
+    /// fine without a daemon — engine just uses defaults.
+    ha_snapshot: Option<Arc<Mutex<HaSnapshot>>>,
+    /// Computed by `engine_tick_system` (Slice 3e); read by
+    /// `ribbon_render_system`. `None` keeps the ribbon hidden.
+    ribbon_text: Option<String>,
+}
+
+/// One snapshot of HA state from the daemon's /ha-state endpoint.
+/// Updated by the poller thread; consumed by `engine_tick_system`.
+#[derive(Clone, Debug, Default)]
+struct HaSnapshot {
+    media: Media,
+    resumable_title: Option<String>,
+    occupancy_present: bool,
+    /// Wall-clock time the snapshot was last refreshed (for staleness
+    /// detection — Bevy renders without HA data if last poll > 5×
+    /// poll_interval old).
+    refreshed_at: Option<std::time::Instant>,
 }
 
 impl Default for EngineRes {
@@ -191,6 +220,10 @@ impl Default for EngineRes {
             // Mid-curve midday default until Slice 3d feeds the real
             // Sarpetorp solar curve via the daemon.
             outdoor_brightness: 0.6,
+            ha_ribbon_title: None,
+            ha_occupancy: false,
+            ha_snapshot: None,
+            ribbon_text: None,
         }
     }
 }
@@ -219,6 +252,12 @@ struct MenuCursorMarker {
 
 #[derive(Component)]
 struct StateBadge;
+
+/// Marker for the resume-offer ribbon text (Slice 3e). One line above
+/// the controller chrome bar; visibility flips on/off per the engine's
+/// KioskHint.ribbon (confident-or-quiet — design § 1).
+#[derive(Component)]
+struct RibbonLabel;
 
 /// Marker for the three preview-pane text spawns; lets one query update
 /// all of them via `match` on the variant. Single-component-with-variant
@@ -267,7 +306,28 @@ fn main() {
             },
         })
         .insert_resource(ClearColor(FOREST_BG))
-        .init_resource::<EngineRes>()
+        .insert_resource({
+            // Slice 3e: start the HA-state poller before the engine
+            // resource initializes — so EngineRes can hold the shared
+            // snapshot handle from the start. SHANNON_KIOSK_DAEMON_URL
+            // overrides the default localhost daemon (defaults to the
+            // daemon binary's bind address). HA_POLL_INTERVAL_SECS
+            // controls Bevy-side cadence; the daemon has its own poll
+            // interval — pick this one to match HA-state freshness
+            // requirements (3s is responsive for paused-media → ribbon
+            // updates while staying cheap on the daemon).
+            let daemon_url = std::env::var("SHANNON_KIOSK_DAEMON_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+            let interval_secs = std::env::var("HA_POLL_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(3);
+            let snap = spawn_ha_state_poller(daemon_url, Duration::from_secs(interval_secs));
+            EngineRes {
+                ha_snapshot: Some(snap),
+                ..Default::default()
+            }
+        })
         .add_plugins(
             DefaultPlugins
                 .set(RenderPlugin {
@@ -307,6 +367,7 @@ fn main() {
                 engine_tick_system,
                 menu_render_system,
                 preview_render_system,
+                ribbon_render_system,
                 state_badge_system,
             ),
         )
@@ -573,6 +634,46 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
         });
     }
 
+    // Resume-offer ribbon line — sits above the controller chrome.
+    // Starts hidden; engine's KioskHint.ribbon turns it on when there's
+    // a confident resume offer (Slice 3e). Centered, single line, with
+    // a leading `[A]` chip in amber to match the chrome.
+    commands.spawn((
+        TextBundle {
+            text: Text::from_sections([
+                // amber [A] chip
+                TextSection::new(
+                    "[A]  ",
+                    TextStyle {
+                        font: fonts.bold.clone(),
+                        font_size: 22.0,
+                        color: AMBER_ACCENT,
+                    },
+                ),
+                // ribbon text (engine-supplied)
+                TextSection::new(
+                    "",
+                    TextStyle {
+                        font: fonts.semibold.clone(),
+                        font_size: 22.0,
+                        color: OAT_MILK,
+                    },
+                ),
+            ])
+            .with_justify(JustifyText::Center),
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Px(965.0), // just above chrome (chrome_y=1010)
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                ..default()
+            },
+            visibility: Visibility::Hidden, // engine turns on when confident
+            ..default()
+        },
+        RibbonLabel,
+    ));
+
     // Engine state badge (top-right) — useful for dev iteration to see
     // the engine in action. May be removed once the preview pane's
     // content fully signals the engine state contextually.
@@ -726,10 +827,38 @@ fn engine_tick_system(
     engine_res.fresh_controller_input = false;
 
     engine_res.since_input += time.delta();
+
+    // Slice 3e — refresh HA-state from the shared snapshot. try_lock
+    // never blocks Bevy; if the poller is mid-write we just skip this
+    // frame and try next tick (snapshot is ~50 bytes, lock contention
+    // is negligible at 30 fps).
+    if let Some(snap_handle) = engine_res.ha_snapshot.clone() {
+        if let Ok(snap) = snap_handle.try_lock() {
+            // Treat stale snapshots (poller stuck > 30s) as "no signal".
+            let fresh_enough = snap
+                .refreshed_at
+                .map(|t| t.elapsed() < Duration::from_secs(30))
+                .unwrap_or(false);
+            if fresh_enough {
+                engine_res.media = snap.media;
+                engine_res.ha_ribbon_title = snap.resumable_title.clone();
+                engine_res.ha_occupancy = snap.occupancy_present;
+            } else {
+                // No fresh data — clear to safe defaults so a stale
+                // playing-media state doesn't pin Content state forever.
+                engine_res.media = Media::None;
+                engine_res.ha_ribbon_title = None;
+            }
+        }
+    }
+
     // Presence oracle: an actual Xbox controller, OR the dev-host
     // keyboard fallback (sticky, set on first keypress). Production
     // Shannon never sees the keyboard path; Mac dev iteration relies on
     // it to demo without an Xbox controller paired to the Mac.
+    // Slice 3e: HA occupancy is informational only — the controller-BT
+    // oracle remains the canonical presence signal (per design hub §3).
+    // ha_occupancy may eventually OR in for the disconnect-grace path.
     let controller_connected = gamepads.iter().count() > 0 || engine_res.dev_keyboard_active;
 
     // Wall-clock as minutes-since-midnight (local time). Slice 3d may
@@ -751,12 +880,106 @@ fn engine_tick_system(
     engine_res.state = outcome.state;
 
     // Apply the predicted cursor ONLY when the user hasn't just acted —
-    // deliberate D-pad nav must dominate the auto-prediction.
+    // deliberate D-pad nav must dominate the auto-prediction. Also
+    // compute the ribbon offer now (Slice 3e) — the engine gates
+    // confidence per the host-supplied resume title.
+    let title_for_hint = engine_res.ha_ribbon_title.clone();
+    let hint = engine_res
+        .engine
+        .hint_with_offer(&inputs, title_for_hint.as_deref());
     if !fresh {
-        let hint = engine_res.engine.hint(&inputs);
         if let Some(predicted) = hint.cursor {
             engine_res.cursor = predicted;
         }
+    }
+    // Cache the computed ribbon for the render system. We store the
+    // String rather than the `RibbonOffer` to keep the EngineRes free
+    // of `crate::context` re-exports beyond what's already used.
+    engine_res.ribbon_text = hint.ribbon.map(|r| r.text);
+}
+
+/// Spawn a std::thread that polls the shannon-kiosk-actions daemon's
+/// /ha-state endpoint and writes the latest snapshot into the shared
+/// `Arc<Mutex<HaSnapshot>>`. The Bevy engine_tick_system reads from
+/// the same Mutex each frame (try_lock — never blocks Bevy).
+///
+/// Slice 3e (Bevy-side HA consumption). Pairs with Slice 3d's
+/// /ha-state endpoint on the daemon.
+///
+/// Failure modes (all silently retried on next interval):
+///   - daemon down (Mac dev iteration without daemon running): each
+///     poll fails with connection-refused; snapshot stays at default.
+///   - daemon transient error (HA outage): same — silent retry.
+///   - reqwest::blocking creates its own tokio runtime in a background
+///     thread; this is fine because Bevy doesn't share that runtime.
+///
+/// Returns the shared snapshot handle so EngineRes can hold a clone
+/// for fast frame-rate reads.
+fn spawn_ha_state_poller(daemon_url: String, interval: Duration) -> Arc<Mutex<HaSnapshot>> {
+    let snapshot = Arc::new(Mutex::new(HaSnapshot::default()));
+    let writer = snapshot.clone();
+    std::thread::Builder::new()
+        .name("ha-state-poller".into())
+        .spawn(move || ha_state_poll_loop(daemon_url, interval, writer))
+        .expect("spawn ha-state-poller thread");
+    snapshot
+}
+
+fn ha_state_poll_loop(daemon_url: String, interval: Duration, writer: Arc<Mutex<HaSnapshot>>) {
+    // 3s timeout — daemon is localhost so any slowness > 3s means it's
+    // wedged. We don't want to block the poller for tens of seconds.
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let url = format!("{}/ha-state", daemon_url.trim_end_matches('/'));
+    loop {
+        std::thread::sleep(interval);
+        let Ok(resp) = client.get(&url).send() else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(json) = resp.json::<serde_json::Value>() else {
+            continue;
+        };
+        let snap = parse_ha_state(&json);
+        if let Ok(mut guard) = writer.lock() {
+            *guard = snap;
+        }
+    }
+}
+
+/// Pure JSON → HaSnapshot parser. The daemon's /ha-state endpoint
+/// emits engine_media as a string ("none" | "music" | "video" | "game")
+/// — easier to parse than reconstructing the MediaPlayerState struct
+/// because Bevy doesn't need the full attribute set, just the engine
+/// inputs.
+fn parse_ha_state(v: &serde_json::Value) -> HaSnapshot {
+    let media = match v.get("engine_media").and_then(|x| x.as_str()) {
+        Some("music") => Media::Music,
+        Some("video") => Media::Video,
+        Some("game") => Media::Game,
+        _ => Media::None,
+    };
+    let resumable_title = v
+        .get("resumable_title")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let occupancy_present = v
+        .get("occupancy_present")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    HaSnapshot {
+        media,
+        resumable_title,
+        occupancy_present,
+        refreshed_at: Some(std::time::Instant::now()),
     }
 }
 
@@ -826,6 +1049,34 @@ fn preview_render_system(engine_res: Res<EngineRes>, mut q: Query<(&mut Text, &P
         };
         if text.sections[0].value != new_value {
             text.sections[0].value = new_value;
+        }
+    }
+}
+
+/// Slice 3e: render the resume-offer ribbon. Visibility flips with the
+/// engine's computed ribbon (cached on EngineRes.ribbon_text). Hidden
+/// keeps the bottom strip empty — silent ribbon (design § 1).
+fn ribbon_render_system(
+    engine_res: Res<EngineRes>,
+    mut q: Query<(&mut Text, &mut Visibility), With<RibbonLabel>>,
+) {
+    if !engine_res.is_changed() {
+        return;
+    }
+    let Ok((mut text, mut vis)) = q.get_single_mut() else {
+        return;
+    };
+    match &engine_res.ribbon_text {
+        Some(t) => {
+            // Section[0] is the "[A]  " amber chip; section[1] is the
+            // engine-computed text — we only update section[1].
+            if text.sections.len() >= 2 && text.sections[1].value != *t {
+                text.sections[1].value = t.clone();
+            }
+            *vis = Visibility::Inherited;
+        }
+        None => {
+            *vis = Visibility::Hidden;
         }
     }
 }
