@@ -11,7 +11,9 @@
 //! gamepad polling) triggers something specific.
 
 use bevy::prelude::*;
-use bevy::render::settings::{Backends, WgpuLimits, WgpuSettings, WgpuSettingsPriority};
+#[cfg(target_os = "linux")]
+use bevy::render::settings::Backends;
+use bevy::render::settings::{WgpuLimits, WgpuSettings, WgpuSettingsPriority};
 use bevy::render::RenderPlugin;
 use bevy::winit::WinitSettings;
 
