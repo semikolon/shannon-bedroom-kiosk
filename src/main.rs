@@ -1,4 +1,4 @@
-//! Shannon bedroom kiosk — Phase 3 production UI (Slice 3c step 1).
+//! Shannon bedroom kiosk — Phase 3 production UI (Slice 3c steps 1 + 2).
 //!
 //! Engine-driven: the Slice-1 `context::Engine` decides DisplayState
 //! (Off/Kiosk/Content/Ambient) each tick; the Slice-3a `Engine::hint`
@@ -17,7 +17,7 @@
 //!   patterns; the amber-on-black + Press Start 2P Phase-2 aesthetic was
 //!   the GPU-stability stepping stone, now superseded
 //!
-//! What this slice DOES ship:
+//! What this slice DOES ship (steps 1 + 2):
 //! - Vertical 6-tile menu (left ~1/3) with Lucide icons + Sharp Sans
 //!   labels + cursor marker (▸)
 //! - Engine integration (Slice 1 + 3a): per-tick `Inputs` assembled
@@ -25,16 +25,19 @@
 //! - Cursor prediction: user input wins; the hint only nudges when
 //!   there's no recent deliberate D-pad nav
 //! - Y button mapping to `Manual::ForceOff`
-//! - Basic controller chrome bar at the bottom (text-only A/B/Y +
-//!   labels — formal colored circle chips come in step 2)
+//! - Background image (sarpetorp-clock-bg.jpg, cover-fit + 20% opacity
+//!   over the forest-radial base — mirrors the dashboard's CSS layering)
+//! - Cursor-driven preview pane (right ~2/3) — stable frame, context-
+//!   filled: huge Lucide icon + big label + dim subtitle, all swap with
+//!   the cursor. Per-tile content is placeholder text for Slice 3c; real
+//!   data lands in 3d/3e
+//! - Basic controller chrome bar at the bottom (text-only A/B/Y labels —
+//!   formal colored Xbox-styled chips come in a future step)
 //!
-//! What this slice DEFERS (Slice 3c step 2):
-//! - Background image (`assets/backgrounds/sarpetorp-clock-bg.jpg`)
-//! - Cursor-driven preview pane (right ~2/3 of the screen)
-//! - Formal Xbox-styled button chips (colored circles with letters)
-//! - Ribbon line styling
-//!
-//! What this slice DEFERS (later slices, see § 13.11):
+//! What this slice DEFERS:
+//! - Formal Xbox-styled colored circle chips (step 2c follow-up; Bevy
+//!   0.14 lacks UI border_radius)
+//! - Ribbon line styling (3e wires the actual offer)
 //! - 3d: daemon HA polling for media + presence
 //! - 3e: ribbon-offer wiring (resume-last-watched)
 //! - 3f: `BlackoutTvPower` + `HdmiSignalTvPower` actuators
@@ -45,9 +48,11 @@
 
 use bevy::input::gamepad::{GamepadAxisChangedEvent, GamepadButtonChangedEvent};
 use bevy::prelude::*;
+use bevy::render::render_asset::RenderAssetUsages;
 #[cfg(target_os = "linux")]
 use bevy::render::settings::Backends;
 use bevy::render::settings::{WgpuLimits, WgpuSettings, WgpuSettingsPriority};
+use bevy::render::texture::{CompressedImageFormats, ImageSampler, ImageType};
 use bevy::render::RenderPlugin;
 use bevy::winit::WinitSettings;
 use shannon_kiosk::context::{
@@ -58,8 +63,9 @@ use std::time::Duration;
 // ─── Sarpetorp forest palette (mirrors the dashboard) ────────────────
 // Background = the forest-radial-gradient base (Sarpetorp index.html
 // `background: radial-gradient(circle at center, rgb(18,30,20) 0%,
-// rgb(15,26,18) 100%)`). Slice 3c step 1 paints the inner color as a
-// flat ClearColor — the bg image + radial overlay land in step 2.
+// rgb(15,26,18) 100%)`). The inner color is painted as a flat ClearColor
+// behind the bg image; the radial-outer ring is a single-color
+// approximation for now (the full radial gradient is observation-tunable).
 const FOREST_BG: Color = Color::srgb(0.071, 0.118, 0.078); // rgb(18,30,20)
 const OAT_MILK: Color = Color::srgb(0.957, 0.937, 0.898); // primary text
 const OAT_DIM: Color = Color::srgb(0.55, 0.56, 0.49); // secondary text
@@ -75,6 +81,21 @@ const AMBER_ACCENT: Color = Color::srgb(0.94, 0.71, 0.18); // selected + [A] (Sa
 const SHARP_SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/SharpSans-Semibold.otf");
 const SHARP_SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/SharpSans-Bold.otf");
 const LUCIDE: &[u8] = include_bytes!("../assets/fonts/Lucide.ttf");
+
+// ─── Embedded background image ──────────────────────────────────────
+// Mirrored from the Sarpetorp dashboard's top widget (`clock-bg.jpg`).
+// Native 3320×5299 portrait (kiosk-station was rotated 90°); we cover-
+// fit it across the 1920×1080 landscape Shannon TV at 20% opacity over
+// the forest base — the calm-nature-old-house feel per user 2026-05-20:
+// "calm and nature and old-house-y, just like the dashboard."
+const BG_IMAGE: &[u8] = include_bytes!("../assets/backgrounds/sarpetorp-clock-bg.jpg");
+
+// Cover-fit scale: max(1920/3320, 1080/5299) = 0.578. Final sprite is
+// 1920 × 3063 (width matches; height overflows; top + bottom get
+// clipped to window) — center-anchored so the photo's middle band shows.
+const BG_FIT_WIDTH: f32 = 1920.0;
+const BG_FIT_HEIGHT: f32 = 3063.0;
+const BG_OPACITY: f32 = 0.20;
 
 // ─── Lucide codepoints for the six menu tiles ────────────────────────
 // Verified against lucide-codepoints.json v1.16.0 (Slice 3b commit).
@@ -192,6 +213,31 @@ struct MenuCursorMarker {
 #[derive(Component)]
 struct StateBadge;
 
+/// Marker for the three preview-pane text spawns; lets one query update
+/// all of them via `match` on the variant. Single-component-with-variant
+/// keeps the system signature simple (clippy-friendly) vs three
+/// independent marker types.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum PreviewElement {
+    Icon,
+    Label,
+    Subtitle,
+}
+
+/// Per-tile preview content. Slice 3c step 2 ships these as placeholders
+/// (icon + label + subtitle); Slice 3d swaps in live data per the
+/// stable-frame-context-filled keystone (design § 1).
+fn preview_for(item: MenuItem) -> (char, &'static str, &'static str) {
+    match item {
+        MenuItem::Games => (ICON_GAMES, "GAMES", "Recently played"),
+        MenuItem::Music => (ICON_MUSIC, "MUSIC", "Now playing"),
+        MenuItem::Lights => (ICON_LIGHTS, "LIGHTS", "Bedroom · Office · Hallway"),
+        MenuItem::Watch => (ICON_WATCH, "WATCH", "Continue watching"),
+        MenuItem::Sensors => (ICON_SENSORS, "SENSORS", "Inomhus · Väder · Tank"),
+        MenuItem::Sleep => (ICON_SLEEP, "SLEEP", "Goodnight"),
+    }
+}
+
 // ─── App entry ──────────────────────────────────────────────────────
 
 fn main() {
@@ -245,17 +291,46 @@ fn main() {
                     ..default()
                 }),
         )
-        .add_systems(Startup, (load_fonts, setup_ui).chain())
+        .add_systems(Startup, (load_fonts, setup_background, setup_ui).chain())
         .add_systems(
             Update,
             (
                 gamepad_event_system,
                 engine_tick_system,
                 menu_render_system,
+                preview_render_system,
                 state_badge_system,
             ),
         )
         .run();
+}
+
+fn setup_background(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    // Load the bg JPEG from embedded bytes — no runtime assets/ dir
+    // dependency. JFIF/JPG is widely supported by `image` crate which
+    // Bevy uses under the hood.
+    let image = Image::from_buffer(
+        BG_IMAGE,
+        ImageType::Extension("jpg"),
+        CompressedImageFormats::NONE,
+        true, // is_srgb: JPG is color, not data
+        ImageSampler::Default,
+        RenderAssetUsages::default(),
+    )
+    .expect("Sarpetorp clock-bg.jpg decodes");
+    let handle = images.add(image);
+    commands.spawn(SpriteBundle {
+        texture: handle,
+        sprite: Sprite {
+            custom_size: Some(Vec2::new(BG_FIT_WIDTH, BG_FIT_HEIGHT)),
+            color: Color::srgba(1.0, 1.0, 1.0, BG_OPACITY),
+            ..default()
+        },
+        // z=-1 to render behind the bevy_ui layer (which defaults to
+        // z=0 on its own UI camera anyway, but explicit > implicit).
+        transform: Transform::from_xyz(0.0, 0.0, -1.0),
+        ..default()
+    });
 }
 
 fn load_fonts(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
@@ -351,8 +426,101 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
         ));
     }
 
-    // Controller chrome bar — bottom strip, text-only for Slice 3c
-    // step 1 (formal Xbox-styled colored circle chips come in step 2).
+    // ─── Cursor-driven preview pane (right 2/3) ────────────────────
+    // Stable frame, context-filled (design § 1): the panel is always
+    // there, its contents update with the cursor. Slice 3c step 2 ships
+    // placeholder per-tile content (icon + label + subtitle); Slice 3d
+    // swaps in live data from the daemon's HA polling.
+    let (default_icon, default_label, default_subtitle) = preview_for(MENU[0].item);
+
+    // Subtle inner-card background to define the pane's region. Bevy
+    // 0.14 has no built-in border_radius for UI nodes (introduced in
+    // 0.15) — square corners for now; rounding can ride on a later
+    // Bevy upgrade per design § 13.13 observation-tuned parameters.
+    commands.spawn(NodeBundle {
+        style: Style {
+            position_type: PositionType::Absolute,
+            top: Val::Px(180.0),
+            left: Val::Px(540.0),
+            width: Val::Px(1320.0),
+            height: Val::Px(720.0),
+            ..default()
+        },
+        background_color: Color::srgba(0.043, 0.071, 0.047, 0.40).into(),
+        border_color: Color::srgba(0.13, 0.18, 0.13, 0.30).into(),
+        ..default()
+    });
+
+    // Preview icon — huge Lucide glyph, single-accent oat-milk
+    commands.spawn((
+        TextBundle {
+            text: Text::from_section(
+                default_icon.to_string(),
+                TextStyle {
+                    font: fonts.lucide.clone(),
+                    font_size: 220.0,
+                    color: OAT_MILK,
+                },
+            ),
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Px(260.0),
+                left: Val::Px(620.0),
+                ..default()
+            },
+            ..default()
+        },
+        PreviewElement::Icon,
+    ));
+
+    // Preview label — big Sharp Sans Bold ALL-CAPS, oat-milk
+    commands.spawn((
+        TextBundle {
+            text: Text::from_section(
+                default_label,
+                TextStyle {
+                    font: fonts.bold.clone(),
+                    font_size: 92.0,
+                    color: OAT_MILK,
+                },
+            ),
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Px(290.0),
+                left: Val::Px(890.0),
+                ..default()
+            },
+            ..default()
+        },
+        PreviewElement::Label,
+    ));
+
+    // Preview subtitle — Sharp Sans Semibold, dimmed
+    commands.spawn((
+        TextBundle {
+            text: Text::from_section(
+                default_subtitle,
+                TextStyle {
+                    font: fonts.semibold.clone(),
+                    font_size: 32.0,
+                    color: OAT_DIM,
+                },
+            ),
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Px(410.0),
+                left: Val::Px(890.0),
+                ..default()
+            },
+            ..default()
+        },
+        PreviewElement::Subtitle,
+    ));
+
+    // Controller chrome bar — bottom strip, text-only for now.
+    // Formal Xbox-styled colored circle chips deferred (Bevy 0.14 has
+    // no native UI border_radius; rounded chips need either a sprite-
+    // texture approach or a Bevy 0.15 upgrade).
     let chrome_specs = [
         ("A", "SELECT", AMBER_ACCENT),
         ("B", "BACK", OAT_DIM),
@@ -398,8 +566,8 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
     }
 
     // Engine state badge (top-right) — useful for dev iteration to see
-    // the engine in action. Will likely disappear in step 2 once the
-    // preview pane carries that signal contextually.
+    // the engine in action. May be removed once the preview pane's
+    // content fully signals the engine state contextually.
     commands.spawn((
         TextBundle {
             text: Text::from_section(
@@ -536,8 +704,8 @@ fn engine_tick_system(
 
 /// Local wall-clock as `ClockMinutes`. Uses chrono-free std::time +
 /// Sweden's standard UTC offset (UTC+1 winter / UTC+2 summer DST handled
-/// by querying the OS for the local time zone in step 2). For Slice 3c
-/// step 1 dev iteration, a coarse UTC fallback is acceptable — the
+/// by querying the OS for the local time zone in Slice 3d). For dev
+/// iteration today, a coarse hard-coded CEST offset is acceptable — the
 /// engine's hard-off / wind-down windows are observation-tuned anyway.
 fn current_local_minutes() -> ClockMinutes {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -584,6 +752,23 @@ fn menu_render_system(
         } else {
             Visibility::Hidden
         };
+    }
+}
+
+fn preview_render_system(engine_res: Res<EngineRes>, mut q: Query<(&mut Text, &PreviewElement)>) {
+    if !engine_res.is_changed() {
+        return;
+    }
+    let (icon, label, subtitle) = preview_for(engine_res.cursor);
+    for (mut text, element) in q.iter_mut() {
+        let new_value = match element {
+            PreviewElement::Icon => icon.to_string(),
+            PreviewElement::Label => label.to_string(),
+            PreviewElement::Subtitle => subtitle.to_string(),
+        };
+        if text.sections[0].value != new_value {
+            text.sections[0].value = new_value;
+        }
     }
 }
 
