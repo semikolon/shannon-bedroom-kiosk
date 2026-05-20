@@ -296,6 +296,52 @@ impl TvPower for SimTvPower {
     }
 }
 
+/// `BlackoutTvPower` (Slice 3f): the default Shannon "TV off" actuator
+/// when no smart-plug or HDMI-signal-off is wired. Records on/off
+/// transitions purely in memory; the Bevy renderer reads
+/// `is_on()` and paints either the kiosk content (on) or an all-black
+/// scene (off). HDMI signal stays live so cage stays the compositor
+/// AND Argon DA2's auto-standby keepalive (the 9-min sine on bedroom
+/// audio) is preserved.
+///
+/// Why this is the default (per design § 13.6): the bedroom Argon amp
+/// keepalive depends on HDMI-source-active. A smart-plug-off path
+/// kills HDMI signal → Argon shuts itself off → 10-min wait when
+/// next playing. Blackout-rendering avoids the chain. The plug-off
+/// path remains available via `HaSmartPlugTvPower` for users without
+/// the Argon constraint.
+#[derive(Debug, Default, Clone)]
+pub struct BlackoutTvPower {
+    on: bool,
+    /// Transition history (every on/off setting in chronological order).
+    /// Useful for tests + observability; never grows unbounded in
+    /// production because the engine only emits transitions, not
+    /// per-tick state.
+    pub history: Vec<bool>,
+}
+
+impl TvPower for BlackoutTvPower {
+    fn set_power(&mut self, on: bool) {
+        self.on = on;
+        self.history.push(on);
+    }
+
+    fn is_on(&self) -> bool {
+        self.on
+    }
+}
+
+impl BlackoutTvPower {
+    /// True when the renderer should paint the kiosk content (state on);
+    /// false when it should paint an all-black scene (state off).
+    /// Alias for `is_on()` for callers that prefer the
+    /// blackout-specific semantic name.
+    #[must_use]
+    pub fn should_render(&self) -> bool {
+        self.on
+    }
+}
+
 /// The context engine. Carries the current state + the sticky manual
 /// override; `step` is the only mutator.
 #[derive(Debug, Clone)]
@@ -892,6 +938,68 @@ mod tests {
         let h3 = e.hint_with_offer(&i, Some(title));
         assert_eq!(h1, h2);
         assert_eq!(h2, h3);
+    }
+
+    // ─── Slice 3f: BlackoutTvPower actuator (Argon-keepalive default) ────
+
+    #[test]
+    fn blackout_tv_power_default_is_off() {
+        let b = BlackoutTvPower::default();
+        assert!(!b.is_on());
+        assert!(!b.should_render());
+        assert!(b.history.is_empty());
+    }
+
+    #[test]
+    fn blackout_tv_power_records_transitions() {
+        let mut b = BlackoutTvPower::default();
+        b.set_power(true);
+        assert!(b.is_on());
+        assert!(b.should_render());
+        b.set_power(false);
+        assert!(!b.is_on());
+        assert!(!b.should_render());
+        b.set_power(true);
+        b.set_power(true); // idempotent set still records (history is honest)
+        b.set_power(false);
+        assert_eq!(b.history, vec![true, false, true, true, false]);
+        assert!(!b.is_on());
+    }
+
+    #[test]
+    fn blackout_tv_power_is_drop_in_compatible_with_sim() {
+        // Same TvPower trait surface — caller code can swap the impl
+        // without changes. This compiles as proof.
+        fn drive<T: TvPower>(t: &mut T) {
+            t.set_power(true);
+            assert!(t.is_on());
+            t.set_power(false);
+            assert!(!t.is_on());
+        }
+        drive(&mut SimTvPower::default());
+        drive(&mut BlackoutTvPower::default());
+    }
+
+    #[test]
+    fn blackout_tv_power_engine_integration_through_apply_engine_action() {
+        // Slice 2's apply_engine_action(...) emits an HaCall only for
+        // SetTvPower(_); it does NOT actuate a TvPower port directly
+        // (the engine emits abstract actions; the daemon translates).
+        // BlackoutTvPower is the Bevy-side actuator: the host applies
+        // the same Action it gets from engine.step's outcome.
+        let mut b = BlackoutTvPower::default();
+        let actions = vec![
+            Action::SetTvPower(true),
+            Action::Show(DisplayState::Kiosk),
+            Action::SetTvPower(false),
+        ];
+        for a in &actions {
+            if let Action::SetTvPower(on) = a {
+                b.set_power(*on);
+            }
+        }
+        assert_eq!(b.history, vec![true, false]);
+        assert!(!b.is_on());
     }
 
     #[test]

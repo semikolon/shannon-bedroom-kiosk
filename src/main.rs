@@ -56,7 +56,8 @@ use bevy::render::texture::{CompressedImageFormats, ImageSampler, ImageType};
 use bevy::render::RenderPlugin;
 use bevy::winit::WinitSettings;
 use shannon_kiosk::context::{
-    ClockMinutes, Config, DisplayState, Engine, Inputs, Manual, Media, MenuItem,
+    Action, BlackoutTvPower, ClockMinutes, Config, DisplayState, Engine, Inputs, Manual, Media,
+    MenuItem, TvPower,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -191,6 +192,12 @@ struct EngineRes {
     /// Computed by `engine_tick_system` (Slice 3e); read by
     /// `ribbon_render_system`. `None` keeps the ribbon hidden.
     ribbon_text: Option<String>,
+    /// Slice 3f: BlackoutTvPower actuator. The default TV-off path —
+    /// paints a black scene instead of cutting HDMI signal (preserves
+    /// Argon DA2 keepalive). When `is_on()` is false, all kiosk UI is
+    /// hidden via `BlackoutRoot` visibility. The engine's
+    /// SetTvPower(_) Action drives this on `step()`.
+    tv_power: BlackoutTvPower,
 }
 
 /// One snapshot of HA state from the daemon's /ha-state endpoint.
@@ -224,6 +231,15 @@ impl Default for EngineRes {
             ha_occupancy: false,
             ha_snapshot: None,
             ribbon_text: None,
+            // Initial TV state: ON (the kiosk renders content). The
+            // engine's first step() emits SetTvPower(_) based on its
+            // computed state, so this default is only the boot-time
+            // value before the first tick.
+            tv_power: {
+                let mut tv = BlackoutTvPower::default();
+                tv.set_power(true);
+                tv
+            },
         }
     }
 }
@@ -258,6 +274,14 @@ struct StateBadge;
 /// KioskHint.ribbon (confident-or-quiet — design § 1).
 #[derive(Component)]
 struct RibbonLabel;
+
+/// Marker for the full-screen black overlay (Slice 3f). When the
+/// engine drives `tv_power` OFF (Off/Content/Ambient transitions
+/// that set TV power), this overlay covers the entire kiosk UI with
+/// pure black — preserves HDMI signal so cage stays the compositor
+/// and Argon DA2's keepalive isn't broken (design § 13.6).
+#[derive(Component)]
+struct BlackoutOverlay;
 
 /// Marker for the three preview-pane text spawns; lets one query update
 /// all of them via `match` on the variant. Single-component-with-variant
@@ -368,6 +392,7 @@ fn main() {
                 menu_render_system,
                 preview_render_system,
                 ribbon_render_system,
+                blackout_render_system,
                 state_badge_system,
             ),
         )
@@ -674,6 +699,30 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
         RibbonLabel,
     ));
 
+    // Full-screen blackout overlay (Slice 3f). Spawned BEFORE the
+    // state badge so the badge stays visible on top (dev observability
+    // — even when blackout is on you can see the engine state in the
+    // corner). On Shannon production this badge will be hidden.
+    // ZIndex::Global pins it just below the badge regardless of
+    // future spawn-order changes.
+    commands.spawn((
+        NodeBundle {
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Px(0.0),
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                bottom: Val::Px(0.0),
+                ..default()
+            },
+            background_color: Color::BLACK.into(),
+            visibility: Visibility::Hidden, // starts off; engine flips on TV-off
+            z_index: ZIndex::Global(500),
+            ..default()
+        },
+        BlackoutOverlay,
+    ));
+
     // Engine state badge (top-right) — useful for dev iteration to see
     // the engine in action. May be removed once the preview pane's
     // content fully signals the engine state contextually.
@@ -879,6 +928,16 @@ fn engine_tick_system(
     let outcome = engine_res.engine.step(&inputs);
     engine_res.state = outcome.state;
 
+    // Slice 3f: route engine TV-power actions through the local
+    // BlackoutTvPower port. The daemon (Slice 2) is the SMART-PLUG
+    // actuator; Blackout is the Bevy-side RENDER toggle (paints black
+    // instead of cutting HDMI, preserving Argon DA2 keepalive).
+    for action in &outcome.actions {
+        if let Action::SetTvPower(on) = action {
+            engine_res.tv_power.set_power(*on);
+        }
+    }
+
     // Apply the predicted cursor ONLY when the user hasn't just acted —
     // deliberate D-pad nav must dominate the auto-prediction. Also
     // compute the ribbon offer now (Slice 3e) — the engine gates
@@ -1079,6 +1138,27 @@ fn ribbon_render_system(
             *vis = Visibility::Hidden;
         }
     }
+}
+
+/// Slice 3f: flip the full-screen blackout overlay per `tv_power`
+/// state. The engine emits SetTvPower(_) on state transitions
+/// (Off↔Kiosk/Content/Ambient); engine_tick_system applies it to
+/// EngineRes.tv_power; this system flips the overlay visibility.
+fn blackout_render_system(
+    engine_res: Res<EngineRes>,
+    mut q: Query<&mut Visibility, With<BlackoutOverlay>>,
+) {
+    if !engine_res.is_changed() {
+        return;
+    }
+    let Ok(mut vis) = q.get_single_mut() else {
+        return;
+    };
+    *vis = if engine_res.tv_power.is_on() {
+        Visibility::Hidden
+    } else {
+        Visibility::Visible
+    };
 }
 
 fn state_badge_system(engine_res: Res<EngineRes>, mut q: Query<&mut Text, With<StateBadge>>) {
