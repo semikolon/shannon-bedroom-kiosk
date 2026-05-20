@@ -19,9 +19,7 @@
 //! `vendored/wgpu-hal-0.21.1-mali-fix/`. See shannon-kiosk.sh for the
 //! env stack and the research doc § A for the full diagnosis.
 
-use bevy::input::gamepad::{
-    GamepadAxisChangedEvent, GamepadButtonChangedEvent,
-};
+use bevy::input::gamepad::{GamepadAxisChangedEvent, GamepadButtonChangedEvent};
 use bevy::prelude::*;
 use bevy::render::settings::{Backends, WgpuLimits, WgpuSettings, WgpuSettingsPriority};
 use bevy::render::RenderPlugin;
@@ -244,10 +242,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     });
 }
 
-fn gamepad_status_system(
-    gamepads: Res<Gamepads>,
-    mut q: Query<&mut Text, With<StatusText>>,
-) {
+fn gamepad_status_system(gamepads: Res<Gamepads>, mut q: Query<&mut Text, With<StatusText>>) {
     let txt = if gamepads.iter().count() == 0 {
         "[ no controller ]".to_string()
     } else {
@@ -322,20 +317,13 @@ fn menu_navigation_system(
     }
 }
 
-fn menu_render_system(
-    state: Res<MenuState>,
-    mut q: Query<(&mut Text, &MenuItemLabel)>,
-) {
+fn menu_render_system(state: Res<MenuState>, mut q: Query<(&mut Text, &MenuItemLabel)>) {
     if !state.is_changed() {
         return;
     }
     for (mut text, item) in q.iter_mut() {
         let is_selected = item.index == state.selected;
-        text.sections[0].style.color = if is_selected {
-            AMBER_BRIGHT
-        } else {
-            AMBER_DIM
-        };
+        text.sections[0].style.color = if is_selected { AMBER_BRIGHT } else { AMBER_DIM };
         let label = MENU_ITEMS[item.index];
         text.sections[0].value = if is_selected {
             format!(">  {}  <", label)
