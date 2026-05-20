@@ -570,7 +570,27 @@ impl Inner {
 
         let (config, supports_native_window) = choose_config(&egl, display, srgb_kind)?;
 
-        let supports_opengl = if version >= (1, 4) {
+        // ---- mali-fix patch (2026-05-20, ported from wgpu-hal-0.21.1-mali-fix) ----
+        // Honor WGPU_GL_PREFER_GLES=1 env var by forcing
+        // bind_api(OPENGL_ES_API) instead of probing CLIENT_APIS for "OpenGL".
+        //
+        // Why this matters on Mali T860 (Midgard) + Mesa Panfrost:
+        // - Panfrost's desktop OpenGL caps at version 3.1 (below wgpu's
+        //   GL backend minimum of 3.3) — picking desktop GL = guaranteed
+        //   adapter rejection later in the pipeline.
+        // - Panfrost's GLES 3.1 satisfies wgpu's GLES-backend minimum of
+        //   GLES 3.0+, so the GLES path is the only working path on this
+        //   hardware.
+        // - Without this opt-in, when the EGL driver advertises both
+        //   "OpenGL" and "OpenGL_ES" in CLIENT_APIS, wgpu chose desktop
+        //   GL — which fails.
+        // - Bevy on Shannon launches with WGPU_GL_PREFER_GLES=1 in the
+        //   shannon-kiosk mode script (~/dotfiles/system/shannon/etc/
+        //   shannon-modes/shannon-kiosk.sh).
+        let force_gles = std::env::var_os("WGPU_GL_PREFER_GLES").is_some();
+        let supports_opengl = if force_gles {
+            false
+        } else if version >= (1, 4) {
             let client_apis = egl
                 .query_string(Some(display), khronos_egl::CLIENT_APIS)
                 .map_err(instance_err("failed to query EGL client APIs string"))?
@@ -587,6 +607,7 @@ impl Inner {
             khronos_egl::OPENGL_ES_API
         })
         .map_err(instance_err("failed to bind API"))?;
+        // ---- END mali-fix patch ----
 
         let mut khr_context_flags = 0;
         let supports_khr_context = display_extensions.contains("EGL_KHR_create_context");
@@ -700,9 +721,46 @@ impl Inner {
                         break result;
                     }
 
-                    // BadAttribute could mean that context creation is not supported at the requested robustness level
-                    // We try the next robustness level.
-                    (Err(khronos_egl::Error::BadAttribute), Some(r)) => {
+                    // ---- mali-fix patch (2026-05-20, ported from wgpu-hal-0.21.1-mali-fix + extended) ----
+                    // Extend the retry-degradable error list from {BadAttribute}
+                    // to {BadAttribute, BadMatch, BadConfig, BadParameter}.
+                    //
+                    // Why: Mesa Panfrost on Mali Midgard (arch 5) arch-gates
+                    // `robust_buffer_access_behavior = arch >= 6` (Mesa 25.3
+                    // release notes: "EGL_EXT_create_context_robustness
+                    // support on Panfrost V10+"). Midgard V5 (T720/T760/T860/
+                    // T880) ADVERTISES the robustness extension at the display
+                    // level (because Mesa's egl entry advertises by category)
+                    // but the underlying behavior is arch-gated — so when wgpu
+                    // requests EGL_CONTEXT_OPENGL_ROBUST_ACCESS_BIT, the
+                    // driver internally probes EGL_EXT_device_query device
+                    // strings and a sub-query fails → user-visible
+                    // `eglQueryDeviceStringEXT EGL_BAD_PARAMETER (0x300c)`
+                    // log line, and Mesa propagates BadParameter (not
+                    // BadMatch / BadConfig) from create_context.
+                    //
+                    // Empirical evidence: wgpu issue #8938 (Jan 2026, OPEN —
+                    // "gl drivers/libraries could not be loaded when Robustness
+                    // is enabled") + Bevy 0.18.1 + wgpu-hal 27.0.4 +
+                    // Rock Pi 4B Mali T860 on Mesa Panfrost 25.0.7 with this
+                    // exact symptom (2026-05-20 Shannon test, design hub §13.20).
+                    //
+                    // Backport of upstream wgpu PRs:
+                    //   * #7952 (wgpu 27.0): initial retry on BadAttribute
+                    //   * #9153 (wgpu 29.0): extends list to BadMatch + BadConfig
+                    // PLUS Mali-Midgard-specific extension: BadParameter
+                    //
+                    // wgpu 27.0.4 (this crate) only has #7952; we're
+                    // back-porting #9153 AND extending it for Midgard V5.
+                    (
+                        Err(
+                            khronos_egl::Error::BadAttribute
+                            | khronos_egl::Error::BadMatch
+                            | khronos_egl::Error::BadConfig
+                            | khronos_egl::Error::BadParameter,
+                        ),
+                        Some(r),
+                    ) => {
                         // Trying EXT robustness if Core robustness is not working
                         // and EXT robustness is supported.
                         robustness = if matches!(r, Robustness::Core)
@@ -715,6 +773,7 @@ impl Inner {
 
                         continue;
                     }
+                    // ---- END mali-fix patch ----
 
                     // Any other error, or depleted robustness levels, we give up.
                     _ => break result,

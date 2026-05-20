@@ -219,6 +219,14 @@ Outstanding Phase 2 design choices (NOT blocking — easy to tweak):
 
 ## Bevy version
 
-Currently Bevy 0.14 (wgpu 0.20). If wgpu's Mali GLES `BadMatch` issue gets fixed in a future Bevy/wgpu release, that may unblock HW-accelerated path on Shannon (would let us drop the `WinitSettings::desktop_app()` reactive constraint and run smoother). Not blocking for Phase 2-3.
+**master = Bevy 0.14 (wgpu 0.20)** — production-stable on Shannon with vendored `wgpu-hal-0.21.1-mali-fix` 4-patch stack.
+
+**`bevy-upgrade` branch = Bevy 0.18.1 (wgpu 27.0.1)** — Mac green at `66d0dbb`+ uncommitted three-patch port to `vendored/wgpu-hal-27.0.4-mali-fix/`. 2026-05-20 late-night autonomous research session converged on the Mali Midgard V5 root cause: Mesa Panfrost advertises `EGL_EXT_create_context_robustness` but its `robust_buffer_access_behavior` flag is arch-gated to V10+ (Bifrost/Valhall). Mesa returns `BadParameter` from `eglCreateContext` when wgpu-hal 27 passes `EGL_CONTEXT_OPENGL_ROBUST_ACCESS=TRUE`; the visible `eglQueryDeviceStringEXT EGL_BAD_PARAMETER` log line is from Mesa's internal device-query during the error path. wgpu PR #7952 (in wgpu 27.0) added retry only for `BadAttribute`; PR #9153 (wgpu 29.0) extends to `BadMatch|BadConfig`; neither catches `BadParameter` — Mali Midgard V5 specific. Three-patch port shipped tonight: (a) `WGPU_GL_PREFER_GLES` honor → `force_gles` sidesteps wgpu-hal 27's NEW OpenGL-first context-creation attempt (lines 675-680 in 27 that 0.21 lacks); (b) robustness retry extended `{BadAttribute}` → `{BadAttribute, BadMatch, BadConfig, BadParameter}`; (c) X11 Wayland-veto kept. Shannon HW-GLES verification IN PROGRESS at the time of this CLAUDE.md update.
+
+If `bevy-upgrade` proves Shannon-stable: merge to master + drop the Lucide-circle workaround for Slice 3c step 3 (Bevy 0.15+ has UI `border_radius`).
+
+If `bevy-upgrade` proves Shannon-blocked despite the three-patch port: rollback is `git checkout master` (zero-cost), continue Slice 3 sub-slices on Bevy 0.14 via the Lucide-circle workaround.
+
+Full Bevy-upgrade arc: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` §§ 13.16-13.22 + verbatim research at `~/dotfiles/docs/shannon_kiosk_bevy_upgrade_mali_research_2026_05_20.md`.
 
 If we hit Bevy resource-use ceilings on Shannon, fallback per kiosk plan § "Why Bevy specifically" is `egui + winit` — lighter, but more glue work for retro shaders.
