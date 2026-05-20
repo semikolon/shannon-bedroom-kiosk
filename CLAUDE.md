@@ -108,6 +108,27 @@ Bevy `WgpuSettings::priority=WebGL2` + custom limits keep us in the GLES 3.0/Web
 - `fb0-convert` (Mac-side `~/.local/bin/fb0-convert`) — BGRA8888 → PNG via Pillow; reads sidecar or filename-encoded dims
 - `shannon-gpu-telemetry` extended to dump `/proc/interrupts` per-snapshot (10s cadence) — survives wedge via SD-shadow + sync; captures pre-wedge IRQ rates for post-hoc delta analysis
 
+### 🎨 May 20, 2026 — Slice 3 visual + interaction language decided (assets in place; engine + Bevy refactor next)
+
+**Canonical hub**: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` § 13 (exhaustive). Highlights:
+
+- **Menu**: Games / Music / Lights / Watch / Sensors / Sleep (six tiles; Sleep replaces the design-doc Settings per user 2026-05-20 — Sleep + engine `ForceOff` beats config-tile-nobody-uses).
+- **Layout**: TLOU-style vertical list left + cursor-driven preview pane right + controller chrome bottom. **No display title** ("let the other stuff take focus").
+- **Typography**: Sharp Sans primary (`assets/fonts/SharpSans-{Regular,Semibold,Bold}.otf`, copied from `~/Library/Fonts/`, commercial license, gitignored). Manrope alternative (`assets/fonts/Manrope-Variable.ttf`, OFL, free to commit). *Correction recorded for posterity in design hub § 13.3: the Sarpetorp dashboard's big "SARPETORP" header is Manrope ExtraBold 0.12em tracking in `ClockWidget.tsx`, not Horsemen — Horsemen.otf is bundled in `dashboard/public/fonts/` but unused; my earlier guess from the filename was wrong, Fredrik caught it.*
+- **Palette + bg**: Sarpetorp forest theme (dark forest radial-gradient base + oat-milk cream text + warm-cream/amber accent). Background = `assets/backgrounds/sarpetorp-clock-bg.jpg`, copied from `~/Projects/sarpetorp/dashboard/public/clock-bg.jpg` (the Sarpetorp dashboard's top-widget bg).
+- **Icons**: Lucide font (pending download), monochrome single-accent discipline (all icons render in the same cream/amber, no rainbow tinting — per Image #10).
+- **TV-off actuator**: `BlackoutTvPower` default (renders black Bevy scene, preserves Argon DA2 keepalive). Opt-in `HdmiSignalTvPower` (`wlr-randr --output HDMI-A-1 --off`, mirrors Sarpetorp's `xset dpms` pattern via `~/Projects/sarpetorp/handlers/display_control_handler.rb`). `HaSmartPlugTvPower` eventual production path.
+- **Y button = ALL OFF** instant shortcut. A select, B back, X reserved.
+- **Engine ext (Slice 3a, pending)**: `KioskHint { cursor: Option<MenuItem>, ribbon: Option<RibbonOffer> }` via `Engine::hint(&Inputs)`. Cursor prediction heuristic: hard-off→Sleep, music-playing→Music, winddown→Watch, morning→Lights, else→None (renderer falls back to Watch). Ribbon stays silent until Slice 3e wires resume-last-watched via daemon HA polling.
+- **Shannon-wide design language**: this visual system applies to Kiosk + Ambient + Off + any future surface.
+
+**Assets in `assets/`** (as of 2026-05-20):
+- `backgrounds/sarpetorp-clock-bg.jpg` — Sarpetorp top-widget bg (4 MB)
+- `fonts/SharpSans-{Regular,Semibold,Bold}.otf` — primary (commercial, gitignored, copy from `~/Library/Fonts/`)
+- `fonts/Manrope-Variable.ttf` — alternative (OFL, committable)
+- `fonts/PressStart2P-Regular.ttf` — legacy Phase-2; remove when main.rs refactors
+- Pending: Lucide icon font (.ttf)
+
 ### ✅ May 17, 2026 — PHASE 2 VALIDATED (watchdog-confound proven by experiment; BLOCKER below is SUPERSEDED) — *2026-05-20 caveat: this "VALIDATED" verdict was UPHELD for short runs but OVERTURNED at length. The watchdog confound was real; the kiosk wedge has additional causes that May-17's 5-6 min sample size couldn't detect. See the May-20 section above.*
 
 **Confound-free bifurcation re-test EXECUTED May 17 ~23:00 CEST → the BLOCKER writeup below is RESOLVED.** With both confounds removed (watchdog observability-only + Demeter USB rootfs), the *exact* May-13 binaries ran rock-stable: minimal Bevy core **6+ min**, full Phase-2 retro menu **5+ min** — uptime monotonic (no reboot), PSI cpu/io ~0.00, `SYSRQ FIRED`=0, HA=200 throughout, Mali-T860 Panfrost adapter clean. The "deep-wedges in 19-27 s, 4+ times" blocker was the `shannon-watchdog` SYSRQ footgun (triple-checked → proven twice). The genuine-Mali residual is **refuted by experiment**. **The escalation ladder (SDL2 / kernel-6.12 / Mesa-25.3.2 / drop-cage / vendor-blob) is MOOTED — do NOT execute it.** Bevy 0.14 + vendored wgpu-hal-0.21.1-mali-fix + cage + Mesa-Panfrost-25.0.7 is viable as-is. Only residue: a ≥1 h soak before `systemctl enable shannon-display.service`. Canonical record: `~/dotfiles/docs/shannon_bedroom_kiosk_plan_2026_05_06.md` Implementation log "May 17 ~23:00 — bifurcation test EXECUTED".

@@ -5,3 +5,9 @@
 
 # Vendored-crate downloads — commit the unpacked tree, not the tarball
 vendored/*.crate
+
+# Commercial font (user-owned personal license): never commit. Copy from
+# ~/Library/Fonts/ at dev-time; load via include_bytes! at build. The OFL
+# Manrope-Variable.ttf alternative IS committed and ships in the binary
+# unconditionally. See dotfiles design hub § 13.3 for the full reasoning.
+assets/fonts/SharpSans-*.otf
