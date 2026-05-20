@@ -166,6 +166,12 @@ struct EngineRes {
     // `engine_tick_system`:
     fresh_controller_input: bool,
     manual_press: Option<Manual>,
+    // Sticky flag: any keyboard input on the dev host enables a
+    // presence-oracle override so `Engine::decide` enters Kiosk even
+    // without a connected Xbox controller. Production Shannon ignores
+    // this (no keyboard is wired). Set true permanently on the first
+    // keyboard event; reset never (a dev session implies presence).
+    dev_keyboard_active: bool,
     // Placeholders for Slice 3d (daemon HA polling):
     media: Media,
     outdoor_brightness: f32,
@@ -180,6 +186,7 @@ impl Default for EngineRes {
             since_input: Duration::from_secs(60),
             fresh_controller_input: false,
             manual_press: None,
+            dev_keyboard_active: false,
             media: Media::None,
             // Mid-curve midday default until Slice 3d feeds the real
             // Sarpetorp solar curve via the daemon.
@@ -296,6 +303,7 @@ fn main() {
             Update,
             (
                 gamepad_event_system,
+                keyboard_event_system,
                 engine_tick_system,
                 menu_render_system,
                 preview_render_system,
@@ -660,6 +668,52 @@ fn gamepad_event_system(
     engine_res.cursor = MENU[cursor_idx].item;
 }
 
+/// Keyboard fallback for dev iteration on the Mac (where the Xbox
+/// controller may not be paired). Mirrors gamepad mappings:
+/// Arrow Up/Down → cursor; Enter/Space → A; Escape → B; Q → Y (ALL OFF).
+/// Any keypress flips the sticky `dev_keyboard_active` flag so the
+/// engine's presence-oracle treats the user as present (otherwise the
+/// engine sits in Off forever, with no Xbox controller wired).
+/// Production Shannon ignores this (no keyboard in the bedroom).
+fn keyboard_event_system(keys: Res<ButtonInput<KeyCode>>, mut engine_res: ResMut<EngineRes>) {
+    let n = MENU.len();
+    let mut cursor_idx = menu_index_of(engine_res.cursor);
+    let mut any_press = false;
+
+    if keys.just_pressed(KeyCode::ArrowUp) {
+        cursor_idx = if cursor_idx == 0 {
+            n - 1
+        } else {
+            cursor_idx - 1
+        };
+        any_press = true;
+    }
+    if keys.just_pressed(KeyCode::ArrowDown) {
+        cursor_idx = (cursor_idx + 1) % n;
+        any_press = true;
+    }
+    if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
+        info!("Selected (keyboard): {:?}", MENU[cursor_idx].item);
+        any_press = true;
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        info!("Back (keyboard)");
+        any_press = true;
+    }
+    if keys.just_pressed(KeyCode::KeyQ) {
+        engine_res.manual_press = Some(Manual::ForceOff);
+        info!("ALL OFF (keyboard Q)");
+        any_press = true;
+    }
+
+    if any_press {
+        engine_res.fresh_controller_input = true;
+        engine_res.since_input = Duration::ZERO;
+        engine_res.dev_keyboard_active = true;
+        engine_res.cursor = MENU[cursor_idx].item;
+    }
+}
+
 fn engine_tick_system(
     time: Res<Time<Real>>,
     gamepads: Res<Gamepads>,
@@ -672,7 +726,11 @@ fn engine_tick_system(
     engine_res.fresh_controller_input = false;
 
     engine_res.since_input += time.delta();
-    let controller_connected = gamepads.iter().count() > 0;
+    // Presence oracle: an actual Xbox controller, OR the dev-host
+    // keyboard fallback (sticky, set on first keypress). Production
+    // Shannon never sees the keyboard path; Mac dev iteration relies on
+    // it to demo without an Xbox controller paired to the Mac.
+    let controller_connected = gamepads.iter().count() > 0 || engine_res.dev_keyboard_active;
 
     // Wall-clock as minutes-since-midnight (local time). Slice 3d may
     // route this through the daemon for fleet-coherent time; for now,
