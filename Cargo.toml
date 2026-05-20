@@ -63,20 +63,29 @@ strip = true
 [profile.dev.package."*"]
 opt-level = 3
 
-# Vendor-patch for wgpu-hal: DISABLED 2026-05-20 during the Bevy 0.14 →
-# 0.18.1 upgrade. The vendored crate at vendored/wgpu-hal-0.21.1-mali-fix
-# is wgpu-hal 0.21.x; Bevy 0.18.1 pulls wgpu-hal 27.x. The Cargo `[patch]`
-# block would silently no-op, masking whether Mali HW-GLES actually
-# works on the new wgpu. First-pass strategy: build Bevy 0.18 without
-# the patch, deploy to Shannon, capture fb0, and observe. If Mali
-# HW-GLES still works (wgpu upstream PRs may have improved the path
-# enough to obviate our 4 patches), we ship without any vendor crate.
-# If Mali breaks, port the 4 patches to wgpu-hal 27 and re-enable.
+# Vendor-patch for wgpu-hal 27.0.4 — ports the EGL_PLATFORM=x11 veto
+# from our original wgpu-hal-0.21.1-mali-fix to the wgpu version Bevy
+# 0.18 pulls. Without this, Mali T860 + Mesa Panfrost's Wayland EGL
+# platform fails `eglQueryDeviceStringEXT EGL_BAD_PARAMETER` during
+# device enumeration → no GPU adapters → Bevy panics at instance
+# creation. The X11 EGL platform (via Xwayland under cage) works fine,
+# but the runtime's `env -u WAYLAND_DISPLAY` isn't sufficient: Wayland
+# client lib falls through to the default `wayland-0` socket in
+# $XDG_RUNTIME_DIR (set by cage). The vendor patch adds a hard veto
+# triggered by `EGL_PLATFORM=x11` env var (already set in our
+# shannon-kiosk.sh mode script).
 #
-# Original vendor patch's diagnosis: ~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md
-# Vendored crate kept at vendored/wgpu-hal-0.21.1-mali-fix/ for reference
-# until Mali outcome is known; will be removed (or replaced with -27)
-# once verified.
+# The 0.21 patch had 4 fixes; the 27 port only needs the EGL_PLATFORM=x11
+# veto because:
+#  - Robustness retry: wgpu-hal 27 already retries Core→Ext→None on
+#    BadAttribute upstream (egl.rs:685-720). Not Mali-specific tied to
+#    BadMatch but the BadAttribute path covers our case.
+#  - bind_api(GLES) forcing: wgpu-hal 27's upstream path already does
+#    GLES fallback when OPENGL_API context creation fails.
+#  - max_texture_dimension_2d=4096: applied in main.rs WgpuSettings.
 #
-# [patch.crates-io]
-# wgpu-hal = { path = "vendored/wgpu-hal-0.21.1-mali-fix" }
+# Diagnosis trail: ~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md
+# + shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md
+# § 13.17-13.20.
+[patch.crates-io]
+wgpu-hal = { path = "vendored/wgpu-hal-27.0.4-mali-fix" }

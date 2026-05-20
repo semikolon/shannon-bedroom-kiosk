@@ -21,11 +21,17 @@ rsync -av --exclude='target/' --exclude='.git/' \
   ~/Projects/shannon-bedroom-kiosk/ \
   darwin:~/shannon-kiosk-build/shannon-bedroom-kiosk/
 
-# 2. Cross-compile (~3m41s first build, ~1m23s incremental)
+# 2. Cross-compile (Bevy 0.18: ~10-15m first build inside Docker, ~30s-2m incremental)
 ssh darwin "cd ~/shannon-kiosk-build/shannon-bedroom-kiosk && \
   PKG_CONFIG_ALLOW_CROSS=1 ~/.cargo/bin/cross build \
     --target aarch64-unknown-linux-gnu --release \
-    --config build.rustc-wrapper='\"\"'"
+    --bin shannon-kiosk"
+
+# NOTE 2026-05-20: dropped the documented `--config build.rustc-wrapper='""'`
+# override. Darwin's ~/.cargo/config.toml intentionally does NOT set
+# build.rustc-wrapper as Cargo config — sccache is provided via RUSTC_WRAPPER
+# env var only (host env not forwarded into cross-rs's Docker container,
+# which lacks sccache). The override broke cargo's TOML parse on Darwin.
 ```
 
 **Deploy to Shannon** (always sync after — `commit=120` ext4 mount loses /etc edits across freezes):
