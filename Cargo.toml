@@ -10,33 +10,34 @@ license = "AGPL-3.0-or-later"
 # Bevy: game-engine for the retro-themed UI.
 # default-features = true gives gamepad support (bevy_gilrs), text rendering,
 # windowing (winit), 2D rendering, asset loading. Trim later if too heavy.
-bevy = { version = "0.14", default-features = false, features = [
-    "animation",
+bevy = { version = "0.18.1", default-features = false, features = [
+    # Bevy 0.18 renamed `animation` → `bevy_animation` and split rendering
+    # into `bevy_<X>_render` sub-features. We don't use animation; drop it.
+    # Sprite/UI now need both the data + render counterparts.
     "bevy_asset",
     "bevy_color",
     "bevy_core_pipeline",
-    "bevy_gilrs",         # gamepad input — first-class Xbox controller
+    "bevy_gilrs",          # gamepad input — first-class Xbox controller
     "bevy_render",
     "bevy_sprite",
+    "bevy_sprite_render",  # Bevy 0.18 split: render half of sprite pipeline
     "bevy_text",
     "bevy_ui",
+    "bevy_ui_render",      # Bevy 0.18 split: render half of UI
     "bevy_winit",
-    "default_font",       # built-in font so we boot before a custom font is loaded
-    "x11",                # X11 backend via Xwayland under cage — REQUIRED on
-                          # Shannon (Mali T860 + Mesa Panfrost). Cannot use
-                          # native Wayland here: wgpu-hal's create_surface
-                          # re-inits the EGL context for Wayland windows
-                          # (gfx-rs/gfx#3545), which terminates the display
-                          # that AdapterContext holds a cloned reference to,
-                          # then panics with BAD_DISPLAY at egl.rs:296.
-                          # See vendored/wgpu-hal-0.21.1-mali-fix/src/gles/
-                          # egl.rs ~line 1025 for the broken upstream branch.
-                          # X11/Xwayland path hits the empty Xlib/Xcb branch
-                          # in the same function and works cleanly.
-    # "wayland",          # DISABLED — see x11 note above. Mac Mini dev runs
-                          # under macOS (Metal backend), not affected.
+    "default_font",        # built-in font so we boot before a custom font is loaded
+    "x11",                 # X11 backend via Xwayland under cage — historically
+                           # REQUIRED on Shannon (Mali T860 + Mesa Panfrost) via
+                           # the vendored wgpu-hal 0.21 patch's create_surface
+                           # fix (gfx-rs/gfx#3545). Verify under wgpu 27 whether
+                           # the X11/Xwayland workaround is still strictly
+                           # required, or if Wayland now works upstream.
+    # "wayland",           # DISABLED historically; revisit per the x11 note.
     "tonemapping_luts",
     "webgl2",
+    "zstd_rust",          # Bevy 0.18's bevy_image now requires explicit zstd
+                          # backend choice (zstd_rust = pure-Rust, no C compiler
+                          # needed; preferred for cross-compile portability).
 ] }
 
 # --- Slice 2: shannon-kiosk-actions daemon ONLY ---
@@ -61,15 +62,20 @@ strip = true
 [profile.dev.package."*"]
 opt-level = 3
 
-# Vendor-patch wgpu-hal 0.21.1 with retry-loop fallback on robustness
-# context creation (backport of upstream wgpu PRs #7952 + #9153). Unlocks
-# HW-accelerated GLES on Mali Midgard (Panfrost arch 5) — required for
-# Shannon's RK3399 Mali T860 GPU. The patch is conditionally compiled in
-# the GLES path (egl.rs is only built on Unix-with-GL), so Mac Mini
-# native Metal builds are unaffected.
+# Vendor-patch for wgpu-hal: DISABLED 2026-05-20 during the Bevy 0.14 →
+# 0.18.1 upgrade. The vendored crate at vendored/wgpu-hal-0.21.1-mali-fix
+# is wgpu-hal 0.21.x; Bevy 0.18.1 pulls wgpu-hal 27.x. The Cargo `[patch]`
+# block would silently no-op, masking whether Mali HW-GLES actually
+# works on the new wgpu. First-pass strategy: build Bevy 0.18 without
+# the patch, deploy to Shannon, capture fb0, and observe. If Mali
+# HW-GLES still works (wgpu upstream PRs may have improved the path
+# enough to obviate our 4 patches), we ship without any vendor crate.
+# If Mali breaks, port the 4 patches to wgpu-hal 27 and re-enable.
 #
-# Full diagnosis: ~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md
-# Patch lives at: vendored/wgpu-hal-0.21.1-mali-fix/src/gles/egl.rs (search
-# "BEGIN mali-fix patch" inside the file).
-[patch.crates-io]
-wgpu-hal = { path = "vendored/wgpu-hal-0.21.1-mali-fix" }
+# Original vendor patch's diagnosis: ~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md
+# Vendored crate kept at vendored/wgpu-hal-0.21.1-mali-fix/ for reference
+# until Mali outcome is known; will be removed (or replaced with -27)
+# once verified.
+#
+# [patch.crates-io]
+# wgpu-hal = { path = "vendored/wgpu-hal-0.21.1-mali-fix" }
