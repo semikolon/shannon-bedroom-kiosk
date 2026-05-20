@@ -108,9 +108,21 @@ Bevy `WgpuSettings::priority=WebGL2` + custom limits keep us in the GLES 3.0/Web
 - `fb0-convert` (Mac-side `~/.local/bin/fb0-convert`) — BGRA8888 → PNG via Pillow; reads sidecar or filename-encoded dims
 - `shannon-gpu-telemetry` extended to dump `/proc/interrupts` per-snapshot (10s cadence) — survives wedge via SD-shadow + sync; captures pre-wedge IRQ rates for post-hoc delta analysis
 
-### 🎨 May 20, 2026 — Slice 3 visual + interaction language decided (assets in place; engine + Bevy refactor next)
+### 🎨 May 20, 2026 — Slice 3a + 3b + 3c (steps 1+2) SHIPPED (autonomous-work session), NOT deployed
 
-**Canonical hub**: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` § 13 (exhaustive). Highlights:
+**Canonical hub**: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` § 13 (exhaustive). § 13.11 slice table + § 13.14 asset inventory + § 13.15 implementation findings re-trued same session.
+
+**4 commits to master** (engine + assets + Bevy refactor + bg/preview pane):
+- `c79e201` Slice 3a — `KioskHint` engine extension (cursor + ribbon, 11 new tests, 32 total green)
+- `a56f801` Slice 3b prep — Lucide font v1.16.0 (MIT, 824 KB)
+- `94ff1fd` Slice 3c step 1 — drop pixelated; Sarpetorp forest palette + Sharp Sans + Lucide + 6-tile menu + engine integration + Y=ForceOff
+- `5117b82` Slice 3c step 2 — bg image cover-fit at 20% + cursor-driven preview pane (huge Lucide icon + big label + dim subtitle per tile)
+
+**Deferred (next steps)**: 3c step 3 (formal Xbox chips — Bevy 0.14 has no UI `border_radius`); 3d (daemon HA polling); 3e (ribbon-offer wiring); 3f (`BlackoutTvPower` + `HdmiSignalTvPower`); 3g (Ambient + Off scene roots).
+
+**Try it locally**: `cd ~/Projects/shannon-bedroom-kiosk && cargo run --bin shannon-kiosk`. With an Xbox controller paired over BT: D-pad / left stick to navigate, A select, B back, Y all-off. Without controller: the menu still renders (engine reports Off but menu UI is always-spawned at startup); a keyboard fallback for dev-without-Xbox is a candidate follow-up.
+
+Highlights:
 
 - **Menu**: Games / Music / Lights / Watch / Sensors / Sleep (six tiles; Sleep replaces the design-doc Settings per user 2026-05-20 — Sleep + engine `ForceOff` beats config-tile-nobody-uses).
 - **Layout**: TLOU-style vertical list left + cursor-driven preview pane right + controller chrome bottom. **No display title** ("let the other stuff take focus").
