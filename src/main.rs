@@ -46,7 +46,7 @@ use bevy::prelude::*;
 use bevy::render::settings::Backends;
 use bevy::render::settings::{WgpuLimits, WgpuSettings, WgpuSettingsPriority};
 use bevy::render::RenderPlugin;
-use bevy::window::WindowResolution;
+use bevy::window::{MonitorSelection, WindowMode, WindowResolution};
 use bevy::winit::WinitSettings;
 use shannon_kiosk::context::{
     Action, BlackoutTvPower, ClockMinutes, Config, DisplayState, Engine, Inputs, Manual, Media,
@@ -92,6 +92,11 @@ const BG_OPACITY: f32 = 0.20;
 const SIDEBAR_WOOD_IMAGE: &[u8] =
     include_bytes!("../assets/backgrounds/wood-panel-bg-540x1080.jpg");
 const SIDEBAR_WIDTH: f32 = 540.0;
+// SIDEBAR_HEIGHT used to be 1080.0 (a fixed pixel value); the sidebar
+// Node now uses Val::Vh(100.0) instead so it fills the viewport on any
+// display. Const retained as a documentation anchor for the asset's
+// natural height — useful if/when a future arc swaps the wood image.
+#[allow(dead_code)]
 const SIDEBAR_HEIGHT: f32 = 1080.0;
 const SIDEBAR_OPACITY: f32 = 0.40;
 
@@ -485,6 +490,20 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "Shannon".to_string(),
+                        // BorderlessFullscreen so Bevy renders at the
+                        // display's native resolution — 1920×1080 on
+                        // the bedroom TV, 3440×1440 on the dev ultrawide.
+                        // Before this (resolution: 1920×1080 hardcoded),
+                        // the ultrawide had a 360 px-tall black band
+                        // below Bevy's window — visible as a "wood
+                        // panel doesn't cover the whole sidebar" gap
+                        // (Fredrik 2026-05-21 screenshot pass). Sidebar
+                        // height uses Val::Vh(100.0) downstream to fill
+                        // whatever resolution we land on.
+                        mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+                        // Resolution kept as a hint for the dev windowed
+                        // case (cargo run on Mac) — ignored under
+                        // BorderlessFullscreen on Shannon's cage.
                         resolution: WindowResolution::new(1920, 1080),
                         resizable: true,
                         ..default()
@@ -862,15 +881,24 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
     commands.spawn(Camera2d);
 
     // ─── Sidebar wood-panel background ────────────────────────────────
-    // Image asset is pre-resized to EXACTLY 540×1080 (sips), matching the
-    // sidebar Node bounds 1:1. Use NodeImageMode::Auto (default) so the
-    // image renders at its natural dimensions — no Stretch quirks, no
-    // overshoot, no short-fall. UI coords top-left-origin. Negative
+    // Image asset is 540×1080 natural pixels. The sidebar Node height
+    // uses Val::Vh(100.0) (= 100% viewport height) so it fills the
+    // window regardless of display: 1080 on the bedroom TV, 1440 on
+    // the dev ultrawide. NodeImageMode::Stretch scales the asset to
+    // the Node bounds so the wood texture covers the whole sidebar
+    // height. Minor Mali Panfrost stretch overshoot (~10 px noted in
+    // an earlier 2026-05-21 session) is acceptable — the alternative
+    // (Auto + natural 540×1080 image) left a black band below y=1080
+    // on the ultrawide that Fredrik flagged as "wood panel doesn't
+    // cover the whole sidebar" (2026-05-21 evening screenshot pass).
+    // Width stays Val::Px(540) — sidebar is a designed UI element with
+    // a fixed pixel chrome width regardless of viewport. Negative
     // GlobalZIndex pins behind menu text / chrome / preview UI.
     commands.spawn((
         ImageNode {
             image: sidebar_bg.0.clone(),
             color: Color::srgba(1.0, 1.0, 1.0, SIDEBAR_OPACITY),
+            image_mode: bevy::ui::widget::NodeImageMode::Stretch,
             ..default()
         },
         Node {
@@ -878,7 +906,7 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
             top: Val::Px(0.0),
             left: Val::Px(0.0),
             width: Val::Px(SIDEBAR_WIDTH),
-            height: Val::Px(SIDEBAR_HEIGHT),
+            height: Val::Vh(100.0),
             ..default()
         },
         GlobalZIndex(-10),
