@@ -383,30 +383,36 @@ fn preview_for(item: MenuItem) -> (char, &'static str, &'static str) {
 fn main() {
     App::new()
         .insert_resource({
-            // Latency diagnostic 2026-05-21: SHANNON_KIOSK_CONTINUOUS=1
-            // forces continuous-update mode (no 33ms wait floor) so we can
-            // A/B test whether Reactive wait is the dominant latency source.
-            // Safety: under May-20 freq caps (A53/A72 @ 1.008 GHz, GPU @ 400 MHz)
-            // continuous mode should NOT wedge the SoC like uncapped May-13 tests.
-            // Default (env unset) remains Reactive 33ms — production behavior.
-            if std::env::var("SHANNON_KIOSK_CONTINUOUS").is_ok() {
-                eprintln!("[shannon-kiosk] SHANNON_KIOSK_CONTINUOUS set — using continuous (game) mode");
-                WinitSettings::game()
-            } else {
-                WinitSettings {
-                    focused_mode: bevy::winit::UpdateMode::Reactive {
-                        wait: Duration::from_millis(33),
-                        react_to_device_events: true,
-                        react_to_user_events: true,
-                        react_to_window_events: true,
-                    },
-                    unfocused_mode: bevy::winit::UpdateMode::Reactive {
-                        wait: Duration::from_millis(33),
-                        react_to_device_events: true,
-                        react_to_user_events: true,
-                        react_to_window_events: true,
-                    },
-                }
+            // Reactive {wait:10ms} — the empirically-chosen default after
+            // the 2026-05-21 latency A/B (design hub § 13.28). The previous
+            // 33ms wait was the upper bound on gamepad-input delivery in
+            // Reactive mode because gilrs events don't trigger winit
+            // wake-up — they sit in the gilrs queue until the next idle
+            // tick fires the Bevy loop. The continuous-mode (game())
+            // alternative shifted natural-pace median latency 125→67 ms but
+            // the slow tail (140-192 ms outliers) survived the mode swap,
+            // confirming the bottleneck is upstream of Bevy (likely Xbox
+            // controller BT radio jitter; deferred to a dedicated arc).
+            // 10ms wait captures the fast-cluster improvement without the
+            // continuous-loop CPU floor — best-of-both per Shannon's freq-
+            // capped (1.008 GHz / 400 MHz GPU) thermal budget.
+            //
+            // The prior SHANNON_KIOSK_CONTINUOUS env-gate was dropped as
+            // dead code post-A/B: continuous mode delivered only marginal
+            // median win and the slow-tail wasn't Bevy-flag-solvable.
+            WinitSettings {
+                focused_mode: bevy::winit::UpdateMode::Reactive {
+                    wait: Duration::from_millis(10),
+                    react_to_device_events: true,
+                    react_to_user_events: true,
+                    react_to_window_events: true,
+                },
+                unfocused_mode: bevy::winit::UpdateMode::Reactive {
+                    wait: Duration::from_millis(10),
+                    react_to_device_events: true,
+                    react_to_user_events: true,
+                    react_to_window_events: true,
+                },
             }
         })
         .insert_resource(ClearColor(FOREST_BG))
@@ -426,7 +432,8 @@ fn main() {
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(3);
-            let snap = spawn_ha_state_poller(daemon_url.clone(), Duration::from_secs(interval_secs));
+            let snap =
+                spawn_ha_state_poller(daemon_url.clone(), Duration::from_secs(interval_secs));
             EngineRes {
                 ha_snapshot: Some(snap),
                 ..Default::default()
@@ -575,6 +582,54 @@ fn try_dispatch_lights(
     true
 }
 
+/// Multi-group debounced dispatch — atomic across all groups in one
+/// debounce window. Used by the X-button "toggle all lights" action
+/// (Fredrik 2026-05-21: *"make it ALL the lights"*) and any future
+/// composite-action call site. A single 300 ms gate covers the whole
+/// burst of N daemon POSTs; faster presses log "throttled" and drop.
+///
+/// Spawns N independent threads — each one a separate POST to
+/// `/lights/<group>/<action>`. The `spawn_daemon_lights_post` helper
+/// is panic-proof on thread-spawn failure (logs `warn!`, drops the
+/// individual call) so even if pthread_create returns EAGAIN under
+/// load, the kiosk continues.
+///
+/// Returns true on first call within the debounce window (any in the
+/// group set), false if throttled.
+fn try_dispatch_lights_multi(
+    engine_res: &mut EngineRes,
+    daemon_url: &DaemonUrl,
+    groups: &[&str],
+    action: &str,
+) -> bool {
+    let now = std::time::Instant::now();
+    if let Some(last) = engine_res.last_lights_action_at {
+        if now.duration_since(last) < Duration::from_millis(LIGHTS_DEBOUNCE_MS) {
+            info!(
+                "lights multi-{} ({} groups) throttled (rapid press)",
+                action,
+                groups.len()
+            );
+            return false;
+        }
+    }
+    engine_res.last_lights_action_at = Some(now);
+    for group in groups {
+        spawn_daemon_lights_post(daemon_url.0.clone(), group.to_string(), action.to_string());
+    }
+    true
+}
+
+/// Groups touched by the X-button "toggle all lights" action (Fredrik
+/// 2026-05-21). Hallway intentionally EXCLUDED because
+/// `group.hallway_indicator` is presence-service-driven and an X press
+/// would race the automation. The child-lock-style entities (Tuya
+/// device-firmware sub-features that integrations surface as their own
+/// switch entities) are structurally excluded — they're not in any
+/// kiosk-known group. See `ha.rs::HaConfig::light_groups` for the
+/// codified principle.
+const X_ALL_TOGGLE_GROUPS: &[&str] = &["bedroom", "office"];
+
 fn setup_background(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
 
@@ -632,11 +687,7 @@ fn load_fonts(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
     });
 }
 
-fn setup_ui(
-    mut commands: Commands,
-    fonts: Res<FontHandles>,
-    sidebar_bg: Res<SidebarBgHandle>,
-) {
+fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<SidebarBgHandle>) {
     commands.spawn(Camera2d);
 
     // ─── Sidebar wood-panel background ────────────────────────────────
@@ -996,11 +1047,17 @@ fn gamepad_event_system(
                 };
                 // Latency diagnostic 2026-05-21: pair vs evtest /dev/input/event1
                 // kernel-arrival timestamp to measure kernel→Bevy delivery.
-                info!("DPadUp: level={:?} cursor_idx={}", engine_res.menu_level, cursor_idx);
+                info!(
+                    "DPadUp: level={:?} cursor_idx={}",
+                    engine_res.menu_level, cursor_idx
+                );
             }
             GamepadButton::DPadDown => {
                 cursor_idx = (cursor_idx + 1) % n;
-                info!("DPadDown: level={:?} cursor_idx={}", engine_res.menu_level, cursor_idx);
+                info!(
+                    "DPadDown: level={:?} cursor_idx={}",
+                    engine_res.menu_level, cursor_idx
+                );
             }
             GamepadButton::South => match engine_res.menu_level {
                 MenuLevel::Root => {
@@ -1042,15 +1099,23 @@ fn gamepad_event_system(
                 info!("ALL OFF (engine ForceOff)");
             }
             GamepadButton::West => {
-                // X = quick toggle bedroom lights (Fredrik 2026-05-21).
-                // Fires regardless of which menu item is selected — a
-                // global shortcut. Reserved as a future "secondary
-                // action" slot per-tile when that lands. Debounced via
-                // try_dispatch_lights — barraging X is what crashed the
-                // kiosk on the original 2026-05-21 session (thread/
-                // runtime exhaustion → pthread_create EAGAIN → panic).
-                info!("X: toggle bedroom lights");
-                try_dispatch_lights(&mut engine_res, &daemon_url, "bedroom", "toggle");
+                // X = global "toggle ALL lights" (Fredrik 2026-05-21
+                // afternoon: *"make it ALL the lights"*). Fires
+                // regardless of which menu item is selected.
+                // X_ALL_TOGGLE_GROUPS = bedroom + office (hallway
+                // excluded — presence-driven, would race the
+                // automation). Atomic 300 ms debounce across all
+                // dispatched POSTs via try_dispatch_lights_multi.
+                // Crash-proof since 2026-05-21 (see ha.rs +
+                // spawn_daemon_lights_post for the barrage-crash
+                // history and child-lock principle).
+                info!("X: toggle ALL lights ({:?})", X_ALL_TOGGLE_GROUPS);
+                try_dispatch_lights_multi(
+                    &mut engine_res,
+                    &daemon_url,
+                    X_ALL_TOGGLE_GROUPS,
+                    "toggle",
+                );
             }
             _ => {}
         }
@@ -1117,10 +1182,13 @@ fn keyboard_event_system(
         any_press = true;
     }
     if keys.just_pressed(KeyCode::KeyX) {
-        // Mirrors Xbox X button — bedroom-toggle global shortcut.
-        // Debounced via the same path as the gamepad West handler.
-        info!("X (keyboard): toggle bedroom lights");
-        try_dispatch_lights(&mut engine_res, &daemon_url, "bedroom", "toggle");
+        // Mirrors Xbox X button — global "toggle ALL lights" shortcut.
+        // Same debounce + multi-dispatch path as the gamepad West arm.
+        info!(
+            "X (keyboard): toggle ALL lights ({:?})",
+            X_ALL_TOGGLE_GROUPS
+        );
+        try_dispatch_lights_multi(&mut engine_res, &daemon_url, X_ALL_TOGGLE_GROUPS, "toggle");
         any_press = true;
     }
 
@@ -1345,26 +1413,50 @@ fn current_local_minutes() -> ClockMinutes {
     ClockMinutes::at(minutes_of_day / 60, minutes_of_day % 60)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn menu_render_system(
     engine_res: Res<EngineRes>,
     mut prev_selected: Local<Option<usize>>,
     mut root_label_q: Query<
         (&mut TextColor, &mut Visibility, &MenuLabel),
-        (Without<MenuIcon>, Without<LightsSubmenuLabel>, Without<LightsSubmenuIcon>),
+        (
+            Without<MenuIcon>,
+            Without<LightsSubmenuLabel>,
+            Without<LightsSubmenuIcon>,
+        ),
     >,
     mut root_icon_q: Query<
         (&mut TextColor, &mut Visibility, &MenuIcon),
-        (Without<MenuLabel>, Without<LightsSubmenuLabel>, Without<LightsSubmenuIcon>),
+        (
+            Without<MenuLabel>,
+            Without<LightsSubmenuLabel>,
+            Without<LightsSubmenuIcon>,
+        ),
     >,
-    mut cursor_q: Query<(&mut Visibility, &MenuCursorMarker), (Without<MenuLabel>, Without<MenuIcon>, Without<LightsSubmenuLabel>, Without<LightsSubmenuIcon>)>,
+    mut cursor_q: Query<
+        (&mut Visibility, &MenuCursorMarker),
+        (
+            Without<MenuLabel>,
+            Without<MenuIcon>,
+            Without<LightsSubmenuLabel>,
+            Without<LightsSubmenuIcon>,
+        ),
+    >,
     mut sub_label_q: Query<
         (&mut TextColor, &mut Visibility, &LightsSubmenuLabel),
-        (Without<MenuLabel>, Without<MenuIcon>, Without<LightsSubmenuIcon>),
+        (
+            Without<MenuLabel>,
+            Without<MenuIcon>,
+            Without<LightsSubmenuIcon>,
+        ),
     >,
     mut sub_icon_q: Query<
         (&mut TextColor, &mut Visibility, &LightsSubmenuIcon),
-        (Without<MenuLabel>, Without<MenuIcon>, Without<LightsSubmenuLabel>),
+        (
+            Without<MenuLabel>,
+            Without<MenuIcon>,
+            Without<LightsSubmenuLabel>,
+        ),
     >,
 ) {
     if !engine_res.is_changed() {

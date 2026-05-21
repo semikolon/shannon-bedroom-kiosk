@@ -91,6 +91,7 @@ async fn main() {
         .route("/ha-state", get(ha_state_handler))
         .route("/signal", post(signal_handler))
         .route("/lights/:group/:action", post(lights_handler))
+        .route("/watch", post(watch_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
@@ -365,6 +366,105 @@ async fn lights_handler(
             Json(json!({ "error": e.to_string() })),
         ),
     }
+}
+
+/// Phase-7 spela-thin-client Layer-4a — fire-and-forget shell spawn of
+/// `spela-local <title>` on this host (Shannon). The shell client owns
+/// the full data pipeline (Darwin spela /play → HLS → local mpv); we
+/// only need to ignite it. Returns 202 immediately so the Bevy UI's
+/// debounce/in-flight gate clears in <50ms instead of waiting on a
+/// Chromecast-style cold-start.
+///
+/// Body: `{"title": "<search query>", "smoke"?: <seconds>}`
+///   - `title` is forwarded verbatim to `spela-local` (which calls
+///     spela's /search?q=<title>); spela's ranker picks result_id=1.
+///   - `smoke` (optional) caps playback duration — passes
+///     `--smoke <secs>` to `spela-local` so the TV isn't stranded with
+///     a 2h movie during integration testing.
+///
+/// Implementation notes:
+///   - `std::process::Command::spawn()` (NOT `tokio::process`) to avoid
+///     adding the tokio `process` feature, which would dirty Cargo.lock
+///     mid-Session-A-work and risk a merge conflict.
+///   - The child is reaped in a `std::thread::spawn` closure to prevent
+///     zombie accumulation (long daemon lifetime, potentially many
+///     plays over weeks).
+///   - Title length capped at 200 bytes (DoS hygiene + sane URL/log
+///     budget); empty title rejected with 400.
+async fn watch_handler(Json(req): Json<WatchReq>) -> impl IntoResponse {
+    let title = req.title.trim();
+    if title.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing or empty title" })),
+        );
+    }
+    if title.len() > 200 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "title too long (>200 bytes)" })),
+        );
+    }
+    // Reject control characters / NUL — defense at the shell-exec boundary
+    // (`Command::arg` doesn't go through a shell, but stray control bytes
+    // in spela-local's logs are noise we don't need).
+    if title.chars().any(|c| c.is_control()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "title contains control characters" })),
+        );
+    }
+
+    let title_owned = title.to_string();
+    let smoke_secs = req.smoke;
+
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("watch-spawn-{}", title_owned.replace(' ', "-")))
+        .spawn(move || {
+            let mut cmd = std::process::Command::new("spela-local");
+            cmd.arg(&title_owned);
+            if let Some(secs) = smoke_secs {
+                cmd.arg("--smoke").arg(secs.to_string());
+            }
+            // Detach stdin/stdout/stderr from the daemon's tty so the
+            // child can outlive any controlling terminal cleanly. mpv
+            // writes to its own log under spela-local's control.
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    // Block this OS thread on the child to reap it
+                    // cleanly. axum's tokio runtime is unaffected.
+                    let _ = child.wait();
+                }
+                Err(e) => {
+                    eprintln!("watch_handler: failed to spawn spela-local: {e}");
+                }
+            }
+        });
+
+    match spawn_result {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "spawned": true,
+                "title": title,
+                "smoke_secs": smoke_secs,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("thread spawn failed: {e}") })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WatchReq {
+    title: String,
+    #[serde(default)]
+    smoke: Option<u32>,
 }
 
 /// Send a planned HA call. Returns a short result tag (never panics; a

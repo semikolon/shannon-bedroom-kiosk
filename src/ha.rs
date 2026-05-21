@@ -52,6 +52,18 @@ pub struct HaConfig {
     pub tv_plug_entity: String,
     /// Friendly kiosk group name → HA group entity. Mirrors the lights-v2
     /// / presence-service groups in `docs/personal_iot.md`.
+    ///
+    /// **Codified principle — excluded by design** (Fredrik 2026-05-21):
+    /// Tuya device-firmware sub-features that integrations surface as
+    /// their own switch entities — e.g. `switch.desk_child_lock` (the
+    /// desk plug's physical-button-disable safety feature) — look like
+    /// "switches" to HA but are NOT user-facing light/plug controls.
+    /// They're device-level configuration. Any kiosk action that says
+    /// "toggle lights" / "toggle all" MUST go through these named
+    /// groups, never sweep-by-entity-type, so these stay safely out.
+    /// Forward-looking guard against any future "toggle all switches"
+    /// composite action accidentally grabbing them. See also
+    /// `docs/personal_iot.md` § "Auxiliary (NOT a lamp)".
     pub light_groups: Vec<(String, String)>,
 }
 
