@@ -21,9 +21,7 @@ rsync -av --exclude='target/' --exclude='.git/' \
   ~/Projects/shannon-bedroom-kiosk/ \
   darwin:~/shannon-kiosk-build/shannon-bedroom-kiosk/
 
-# 2. Cross-compile (master Bevy 0.14: ~3-5m first build, ~1-2m incremental;
-#    bevy-upgrade Bevy 0.18: ~10-15m first, ~3-5m incremental due to
-#    larger dep tree)
+# 2. Cross-compile (Bevy 0.18: ~10-15m first build inside Docker, ~30s-2m incremental)
 ssh darwin "cd ~/shannon-kiosk-build/shannon-bedroom-kiosk && \
   PKG_CONFIG_ALLOW_CROSS=1 ~/.cargo/bin/cross build \
     --target aarch64-unknown-linux-gnu --release \
@@ -237,12 +235,12 @@ Outstanding Phase 2 design choices (NOT blocking — easy to tweak):
 
 ## Bevy version
 
-**master = Bevy 0.14 (wgpu 0.20)** — production-stable on Shannon, Slices 3a-3g all SHIPPED + LIVE-VERIFIED. Uses vendored `wgpu-hal-0.21.1-mali-fix` (4 patches) + `jpeg` Bevy feature + `zune-core = "=0.5.0-rc2"` pin + 2506×4000 bg jpg to fit Mali 4096 texture limit.
+**Unified (post-merge 2026-05-21)**: Bevy 0.18.1 (wgpu 27.0.1) + Slices 3a-3g — LIVE-VERIFIED on Shannon Mali T860 Panfrost OpenGL ES 3.1 Mesa 25.0.7-2 backend Gl. Uses vendored `wgpu-hal-27.0.4-mali-fix/` (3 patches: X11 Wayland-veto + `WGPU_GL_PREFER_GLES` force_gles bind_api + robustness retry extended to `BadParameter` for Mali Midgard V5) + direct `wgpu = { version = "27", default-features = false, features = ["gles", "wgsl"] }` dep in Cargo.toml + `jpeg` Bevy feature + `zune-core = "=0.5.0-rc2"` pin + bg jpg resized to 2506×4000 (Mali 4096 texture limit).
 
-**`bevy-upgrade` branch = Bevy 0.18.1 (wgpu 27.0.1)** — **LIVE-VERIFIED on Shannon Mali HW-GLES 2026-05-21**. 5+ min steady-state soak. Root cause of the night's blocker was a missing wgpu `gles` feature flag: `bevy_render-0.18.1`'s wgpu dep is `default-features=false, features=["wgsl","dx12","metal","vulkan","naga-ir","fragile-send-sync-non-atomic-wasm"]` — `gles` NOT in list, so the GL backend wasn't compiled in. Bevy's top-level `webgl2` feature maps to `wgpu/webgl` (WASM-only), NOT `wgpu/gles` (native Linux). Fix: direct `wgpu = { version = "27", default-features = false, features = ["gles", "wgsl"] }` dep in `Cargo.toml`; Cargo's feature-unification activates `gles` on bevy_render's wgpu dep transitively. Three wgpu-hal vendor patches (X11 Wayland-veto + force_gles bind_api + robustness retry incl. BadParameter) kept as defense-in-depth in `vendored/wgpu-hal-27.0.4-mali-fix/`.
+**THE actual root cause** of the Bevy 0.18 Mali blocker (after 3 wgpu-hal patches + Mesa env vars all hit the same `eglQueryDeviceStringEXT BAD_PARAMETER`): `bevy_render-0.18.1`'s wgpu dep is `default-features=false, features=["wgsl","dx12","metal","vulkan","naga-ir","fragile-send-sync-non-atomic-wasm"]` — **`gles` is NOT in the list**. Bevy 0.18's top-level `webgl2` feature maps to `wgpu/webgl` (WASM-only), NOT `wgpu/gles` (native Linux). Fix: direct `wgpu` dep with `gles` feature activates it on bevy_render's wgpu dep too via Cargo's feature-unification. The three wgpu-hal vendor patches kept as defense-in-depth — they live inside the GL backend code that didn't exist without the feature.
 
-**Merge recommendation**: when convenient, merge `bevy-upgrade` → master. Unblocks Slice 3c step 3 (formal Xbox-styled chips via Bevy 0.15+ UI `border_radius`), brings ECS perf improvements + cosmic-text Unicode + modern gamepad event API.
+Master rollback path: pre-merge state preserved at git tag/SHA `d79f039`.
 
-Full Bevy-upgrade arc: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` §§ 13.16-13.25 + verbatim subagent research at `~/dotfiles/docs/shannon_kiosk_bevy_upgrade_mali_research_2026_05_20.md` + generalizable insight mirrored to `~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md` § H.
+Full Bevy-upgrade arc: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` §§ 13.16-13.25 + verbatim subagent research at `~/dotfiles/docs/shannon_kiosk_bevy_upgrade_mali_research_2026_05_20.md` (preserved as a symptom-vs-cause lesson — the subagents reasoned correctly about wgpu-hal-27 EGL but missed the feature-compile layer below) + generalizable insight mirrored to `~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md` § H.
 
 If we hit Bevy resource-use ceilings on Shannon, fallback per kiosk plan § "Why Bevy specifically" is `egui + winit` — lighter, but more glue work for retro shaders.

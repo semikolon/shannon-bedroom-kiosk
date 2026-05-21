@@ -10,36 +10,42 @@ license = "AGPL-3.0-or-later"
 # Bevy: game-engine for the retro-themed UI.
 # default-features = true gives gamepad support (bevy_gilrs), text rendering,
 # windowing (winit), 2D rendering, asset loading. Trim later if too heavy.
-bevy = { version = "0.14", default-features = false, features = [
-    "animation",
+bevy = { version = "0.18.1", default-features = false, features = [
+    # Bevy 0.18 renamed `animation` → `bevy_animation` and split rendering
+    # into `bevy_<X>_render` sub-features. We don't use animation; drop it.
+    # Sprite/UI now need both the data + render counterparts.
     "bevy_asset",
     "bevy_color",
     "bevy_core_pipeline",
-    "bevy_gilrs",         # gamepad input — first-class Xbox controller
+    "bevy_gilrs",          # gamepad input — first-class Xbox controller
+    "bevy_log",            # info!/warn!/error! macros + tracing-based logging
     "bevy_render",
     "bevy_sprite",
+    "bevy_sprite_render",  # Bevy 0.18 split: render half of sprite pipeline
     "bevy_text",
     "bevy_ui",
+    "bevy_ui_render",      # Bevy 0.18 split: render half of UI
     "bevy_winit",
-    "default_font",       # built-in font so we boot before a custom font is loaded
-    "x11",                # X11 backend via Xwayland under cage — REQUIRED on
-                          # Shannon (Mali T860 + Mesa Panfrost). Cannot use
-                          # native Wayland here: wgpu-hal's create_surface
-                          # re-inits the EGL context for Wayland windows
-                          # (gfx-rs/gfx#3545), which terminates the display
-                          # that AdapterContext holds a cloned reference to,
-                          # then panics with BAD_DISPLAY at egl.rs:296.
-                          # See vendored/wgpu-hal-0.21.1-mali-fix/src/gles/
-                          # egl.rs ~line 1025 for the broken upstream branch.
-                          # X11/Xwayland path hits the empty Xlib/Xcb branch
-                          # in the same function and works cleanly.
-    # "wayland",          # DISABLED — see x11 note above. Mac Mini dev runs
-                          # under macOS (Metal backend), not affected.
+    "default_font",        # built-in font so we boot before a custom font is loaded
+    "x11",                 # X11 backend via Xwayland under cage — historically
+                           # REQUIRED on Shannon (Mali T860 + Mesa Panfrost) via
+                           # the vendored wgpu-hal 0.21 patch's create_surface
+                           # fix (gfx-rs/gfx#3545). Verify under wgpu 27 whether
+                           # the X11/Xwayland workaround is still strictly
+                           # required, or if Wayland now works upstream.
+    # "wayland",           # DISABLED historically; revisit per the x11 note.
     "tonemapping_luts",
     "webgl2",
-    "jpeg",               # JPEG decoder — required for Slice 3c step 2's
-                          # `sarpetorp-clock-bg.jpg`. Without this, Shannon
-                          # panics in setup_background. Surfaced 2026-05-20.
+    "jpeg",                # JPEG decoder — required by Slice 3c step 2's
+                           # `sarpetorp-clock-bg.jpg`. Without this, Shannon
+                           # panics on first frame in setup_background.
+                           # Surfaced 2026-05-20; Mac dev never triggered
+                           # before because Slice 3c step 2 never ran on
+                           # Shannon. Adds `image/jpeg` to Bevy's image
+                           # loading stack.
+    "zstd_rust",           # Bevy 0.18's bevy_image now requires explicit zstd
+                           # backend choice (zstd_rust = pure-Rust, no C compiler
+                           # needed; preferred for cross-compile portability).
 ] }
 
 # --- Slice 2: shannon-kiosk-actions daemon ONLY ---
@@ -53,11 +59,26 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# --- Bevy 0.18 GL-backend feature enablement (CRITICAL for Shannon) ---
+# 2026-05-21 root-cause finding: bevy_render-0.18.1's wgpu dep is
+# `default-features=false, features=["wgsl","dx12","metal","vulkan",
+# "naga-ir","fragile-send-sync-non-atomic-wasm"]` — `gles` is NOT in
+# the list. Bevy 0.18's top-level `webgl2` feature maps to
+# `wgpu/webgl` (the WASM-target feature), NOT `wgpu/gles` (the native
+# Linux GL backend). Result: without this explicit dep, runtime
+# `Backends::GL` finds NO GL backend compiled in → `request_adapter`
+# returns None in microseconds → "Unable to find a GPU!" panic.
+#
+# Cargo's feature-unification means adding wgpu as a direct dep with
+# `gles` activates it on bevy_render's wgpu dep too. Mac (Metal) is
+# unaffected — bevy_render's `metal` feature handles that path.
+wgpu = { version = "27", default-features = false, features = ["gles", "wgsl"] }
+
 # zune-core only ships 0.5.0-rcN on crates.io (no stable 0.5.0). The
-# Bevy 0.14 `jpeg` feature → `zune-jpeg` → `zune-core ^0.5.0` would
-# fail to resolve without this prerelease opt-in. Pinning to rc2 (the
-# latest known-good). Without this, `cargo build` errors out with
-# "candidate versions found which didn't match" for zune-core.
+# `jpeg` feature → `zune-jpeg` → `zune-core ^0.5.0` would fail to
+# resolve without this prerelease opt-in. Pinning to rc2 (the latest
+# known-good). Without this, `cargo build` errors out with "candidate
+# versions found which didn't match" for zune-core.
 zune-core = "=0.5.0-rc2"
 
 # Performance profile for release — Bevy is heavy without optimizations
@@ -71,15 +92,29 @@ strip = true
 [profile.dev.package."*"]
 opt-level = 3
 
-# Vendor-patch wgpu-hal 0.21.1 with retry-loop fallback on robustness
-# context creation (backport of upstream wgpu PRs #7952 + #9153). Unlocks
-# HW-accelerated GLES on Mali Midgard (Panfrost arch 5) — required for
-# Shannon's RK3399 Mali T860 GPU. The patch is conditionally compiled in
-# the GLES path (egl.rs is only built on Unix-with-GL), so Mac Mini
-# native Metal builds are unaffected.
+# Vendor-patch for wgpu-hal 27.0.4 — ports the EGL_PLATFORM=x11 veto
+# from our original wgpu-hal-0.21.1-mali-fix to the wgpu version Bevy
+# 0.18 pulls. Without this, Mali T860 + Mesa Panfrost's Wayland EGL
+# platform fails `eglQueryDeviceStringEXT EGL_BAD_PARAMETER` during
+# device enumeration → no GPU adapters → Bevy panics at instance
+# creation. The X11 EGL platform (via Xwayland under cage) works fine,
+# but the runtime's `env -u WAYLAND_DISPLAY` isn't sufficient: Wayland
+# client lib falls through to the default `wayland-0` socket in
+# $XDG_RUNTIME_DIR (set by cage). The vendor patch adds a hard veto
+# triggered by `EGL_PLATFORM=x11` env var (already set in our
+# shannon-kiosk.sh mode script).
 #
-# Full diagnosis: ~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md
-# Patch lives at: vendored/wgpu-hal-0.21.1-mali-fix/src/gles/egl.rs (search
-# "BEGIN mali-fix patch" inside the file).
+# The 0.21 patch had 4 fixes; the 27 port only needs the EGL_PLATFORM=x11
+# veto because:
+#  - Robustness retry: wgpu-hal 27 already retries Core→Ext→None on
+#    BadAttribute upstream (egl.rs:685-720). Not Mali-specific tied to
+#    BadMatch but the BadAttribute path covers our case.
+#  - bind_api(GLES) forcing: wgpu-hal 27's upstream path already does
+#    GLES fallback when OPENGL_API context creation fails.
+#  - max_texture_dimension_2d=4096: applied in main.rs WgpuSettings.
+#
+# Diagnosis trail: ~/dotfiles/docs/bedroom_kiosk_gpu_research_2026_05_06.md
+# + shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md
+# § 13.17-13.20.
 [patch.crates-io]
-wgpu-hal = { path = "vendored/wgpu-hal-0.21.1-mali-fix" }
+wgpu-hal = { path = "vendored/wgpu-hal-27.0.4-mali-fix" }
