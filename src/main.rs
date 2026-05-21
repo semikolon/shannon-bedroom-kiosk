@@ -1577,8 +1577,9 @@ fn engine_tick_system(
     }
 
     // Apply the predicted cursor ONLY on engine-state transition INTO
-    // Kiosk (from Off/Ambient/Content). The Slice 3a hint design
-    // (design hub § 13.7) is "stable frame, context-filled":
+    // Kiosk (from Off/Ambient/Content), and only when that transition
+    // was not caused by direct input this same tick. The Slice 3a hint
+    // design (design hub § 13.7) is "stable frame, context-filled":
     // pre-position the cursor when the user RETURNS, not on every
     // non-fresh frame nor at arbitrary idle timeouts (both of which
     // make the cursor snap-back while user is just viewing the menu).
@@ -1598,15 +1599,25 @@ fn engine_tick_system(
     let just_entered_kiosk =
         matches!(outcome.state, DisplayState::Kiosk) && !engine_res.was_in_kiosk;
     if just_entered_kiosk {
-        if let Some(predicted) = hint.cursor {
-            engine_res.cursor = predicted;
+        // A controller press from Ambient/Off both wakes the Kiosk state
+        // and mutates UI state before this system runs. Re-applying the
+        // prediction here makes D-pad navigation visibly jump back to
+        // Watch/Lights; resetting the submenu here can also undo an
+        // A-on-Lights open. Preserve direct input; keep prediction/reset
+        // for passive/context returns.
+        if !fresh {
+            if let Some(predicted) = hint.cursor {
+                engine_res.cursor = predicted;
+            }
+            // Reset submenu state on Kiosk re-entry — don't strand the user
+            // in a stale Lights submenu after the screen had been off /
+            // ambient. Pairing with the snap-back fix's discipline of
+            // "context-fill on RETURN" (design § 13.7).
+            engine_res.menu_level = MenuLevel::Root;
+            engine_res.submenu_cursor = 0;
+        } else {
+            info!("Kiosk entry prediction/reset skipped: fresh input already changed UI");
         }
-        // Reset submenu state on Kiosk re-entry — don't strand the user
-        // in a stale Lights submenu after the screen had been off /
-        // ambient. Pairing with the snap-back fix's discipline of
-        // "context-fill on RETURN" (design § 13.7).
-        engine_res.menu_level = MenuLevel::Root;
-        engine_res.submenu_cursor = 0;
     }
     engine_res.was_in_kiosk = matches!(outcome.state, DisplayState::Kiosk);
     // Cache the computed ribbon for the render system. We store the
