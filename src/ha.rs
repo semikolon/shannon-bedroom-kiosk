@@ -98,9 +98,12 @@ pub fn plan_tv_power(on: bool, cfg: &HaConfig) -> HaCall {
     }
 }
 
-/// Plan a lights group call from a kiosk request. `action` is `"on"` or
-/// `"off"` (case-insensitive). Uses the `homeassistant` domain so the
-/// same call works whether the entity is a `group.`, `light.`, or scene.
+/// Plan a lights group call from a kiosk request. `action` is `"on"`,
+/// `"off"`, or `"toggle"` (case-insensitive). Uses the `homeassistant`
+/// domain so the same call works whether the entity is a `group.`,
+/// `light.`, or scene. `toggle` lets the kiosk fire a single button to
+/// flip a group without needing to track the current HA state — the
+/// `homeassistant.toggle` service handles state-flip server-side.
 pub fn plan_lights(group: &str, action: &str, cfg: &HaConfig) -> Result<HaCall, HaError> {
     let entity = cfg
         .resolve_group(group)
@@ -108,6 +111,7 @@ pub fn plan_lights(group: &str, action: &str, cfg: &HaConfig) -> Result<HaCall, 
     let service = match action.to_ascii_lowercase().as_str() {
         "on" => "turn_on",
         "off" => "turn_off",
+        "toggle" => "toggle",
         other => return Err(HaError::UnknownAction(other.to_string())),
     };
     Ok(HaCall {
@@ -170,6 +174,24 @@ mod tests {
         assert_eq!(
             plan_lights("bedroom", "dim", &c),
             Err(HaError::UnknownAction("dim".into()))
+        );
+    }
+
+    #[test]
+    fn lights_toggle_dispatches_homeassistant_toggle() {
+        // X-button bedroom-quick-toggle (Fredrik 2026-05-21) flows through
+        // this code path; the daemon POSTs /lights/bedroom/toggle and we
+        // emit `homeassistant.toggle` on the bedroom group — HA flips the
+        // current state server-side so the kiosk never has to track it.
+        let c = HaConfig::default();
+        let call = plan_lights("bedroom", "toggle", &c).expect("toggle is valid");
+        assert_eq!(call.domain, "homeassistant");
+        assert_eq!(call.service, "toggle");
+        assert_eq!(call.entity_id, "group.bedroom_lights");
+        // case-insensitive on action too
+        assert_eq!(
+            plan_lights("office", "TOGGLE", &c).unwrap().service,
+            "toggle"
         );
     }
 

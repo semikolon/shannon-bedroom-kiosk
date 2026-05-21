@@ -40,7 +40,7 @@
 
 use bevy::asset::RenderAssetUsages;
 use bevy::input::gamepad::{GamepadAxisChangedEvent, GamepadButtonChangedEvent};
-use bevy::log::info;
+use bevy::log::{info, warn};
 use bevy::prelude::*;
 #[cfg(target_os = "linux")]
 use bevy::render::settings::Backends;
@@ -354,11 +354,20 @@ fn main() {
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(3);
-            let snap = spawn_ha_state_poller(daemon_url, Duration::from_secs(interval_secs));
+            let snap = spawn_ha_state_poller(daemon_url.clone(), Duration::from_secs(interval_secs));
             EngineRes {
                 ha_snapshot: Some(snap),
                 ..Default::default()
             }
+        })
+        .insert_resource({
+            // Daemon URL also kept as its own resource so outbound POST
+            // helpers (X-toggle, future Lights submenu A-select) can
+            // access it from gamepad_event_system without threading it
+            // through EngineRes.
+            let daemon_url = std::env::var("SHANNON_KIOSK_DAEMON_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+            DaemonUrl(daemon_url)
         })
         .add_plugins(
             DefaultPlugins
@@ -409,6 +418,48 @@ fn main() {
 /// setup_background, consumed by setup_ui's sidebar ImageNode spawn.
 #[derive(Resource)]
 struct SidebarBgHandle(Handle<Image>);
+
+/// URL of the local shannon-kiosk-actions daemon. Read once at startup
+/// and copied into outbound POST helpers (`spawn_daemon_lights_post`).
+/// Mirrors the value used by `spawn_ha_state_poller` for inbound polling.
+#[derive(Resource, Clone)]
+struct DaemonUrl(String);
+
+/// Fire-and-forget POST to the daemon's `/lights/:group/:action`. Used by
+/// the X-button bedroom-quick-toggle (Fredrik 2026-05-21: *"X when Lights
+/// is selected (or really why not regardless of choice) can be a quick
+/// btn to toggle bedroom lights off/on"*) and by the Lights submenu's A-
+/// select. Spawns a short-lived std::thread + reqwest::blocking with a 5s
+/// timeout — never blocks the Bevy main loop. Result is logged but no
+/// retry / no callback; the daemon already has its own retry semantics
+/// for HA failures (see ha_state_poll_loop for the pattern this mirrors).
+fn spawn_daemon_lights_post(daemon_url: String, group: String, action: String) {
+    std::thread::Builder::new()
+        .name(format!("daemon-post-lights-{group}-{action}"))
+        .spawn(move || {
+            let url = format!(
+                "{}/lights/{}/{}",
+                daemon_url.trim_end_matches('/'),
+                group,
+                action
+            );
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("daemon-post: client build failed: {e}");
+                    return;
+                }
+            };
+            match client.post(&url).send() {
+                Ok(resp) => info!("daemon POST {} → {}", url, resp.status()),
+                Err(e) => warn!("daemon POST {} failed: {}", url, e),
+            }
+        })
+        .expect("spawn daemon-post thread");
+}
 
 fn setup_background(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
@@ -627,10 +678,11 @@ fn setup_ui(
     let chrome_specs = [
         ("A", "SELECT", AMBER_ACCENT),
         ("B", "BACK", OAT_DIM),
+        ("X", "LIGHTS", OAT_DIM),
         ("Y", "ALL OFF", OAT_DIM),
     ];
-    let chrome_y_start = 920.0;
-    let chrome_row_gap = 45.0;
+    let chrome_y_start = 905.0;
+    let chrome_row_gap = 42.0;
     let chrome_glyph_x = 130.0;
     let chrome_label_x = 175.0;
     for (i, (button, label, color)) in chrome_specs.iter().enumerate() {
@@ -763,6 +815,7 @@ fn gamepad_event_system(
     mut button_events: MessageReader<GamepadButtonChangedEvent>,
     mut axis_events: MessageReader<GamepadAxisChangedEvent>,
     mut engine_res: ResMut<EngineRes>,
+    daemon_url: Res<DaemonUrl>,
 ) {
     let n = MENU.len();
     let mut cursor_idx = menu_index_of(engine_res.cursor);
@@ -798,6 +851,18 @@ fn gamepad_event_system(
                 engine_res.manual_press = Some(Manual::ForceOff);
                 info!("ALL OFF (engine ForceOff)");
             }
+            GamepadButton::West => {
+                // X = quick toggle bedroom lights (Fredrik 2026-05-21).
+                // Fires regardless of which menu item is selected — a
+                // global shortcut. Reserved as a future "secondary
+                // action" slot per-tile when that lands.
+                info!("X: toggle bedroom lights");
+                spawn_daemon_lights_post(
+                    daemon_url.0.clone(),
+                    "bedroom".to_string(),
+                    "toggle".to_string(),
+                );
+            }
             _ => {}
         }
     }
@@ -824,7 +889,11 @@ fn gamepad_event_system(
     engine_res.cursor = MENU[cursor_idx].item;
 }
 
-fn keyboard_event_system(keys: Res<ButtonInput<KeyCode>>, mut engine_res: ResMut<EngineRes>) {
+fn keyboard_event_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut engine_res: ResMut<EngineRes>,
+    daemon_url: Res<DaemonUrl>,
+) {
     let n = MENU.len();
     let mut cursor_idx = menu_index_of(engine_res.cursor);
     let mut any_press = false;
@@ -852,6 +921,16 @@ fn keyboard_event_system(keys: Res<ButtonInput<KeyCode>>, mut engine_res: ResMut
     if keys.just_pressed(KeyCode::KeyQ) {
         engine_res.manual_press = Some(Manual::ForceOff);
         info!("ALL OFF (keyboard Q)");
+        any_press = true;
+    }
+    if keys.just_pressed(KeyCode::KeyX) {
+        // Mirrors Xbox X button — bedroom-toggle global shortcut.
+        info!("X (keyboard): toggle bedroom lights");
+        spawn_daemon_lights_post(
+            daemon_url.0.clone(),
+            "bedroom".to_string(),
+            "toggle".to_string(),
+        );
         any_press = true;
     }
 
