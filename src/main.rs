@@ -162,6 +162,12 @@ struct EngineRes {
     /// hidden via `BlackoutRoot` visibility. The engine's
     /// SetTvPower(_) Action drives this on `step()`.
     tv_power: BlackoutTvPower,
+    /// Tracks whether the engine was in `DisplayState::Kiosk` on the
+    /// previous tick. Used to gate cursor-prediction-pre-positioning
+    /// (design hub § 13.7) so it fires only on TRANSITION INTO Kiosk
+    /// (from Off/Ambient/Content), not every non-fresh frame nor on
+    /// an arbitrary idle timeout. The "snap-back" bug fix.
+    was_in_kiosk: bool,
 }
 
 /// One snapshot of HA state from the daemon's /ha-state endpoint.
@@ -202,6 +208,10 @@ impl Default for EngineRes {
                 tv.set_power(true);
                 tv
             },
+            // Start `was_in_kiosk = false` so the FIRST transition into
+            // Kiosk (from initial Off state) fires the cursor pre-
+            // position. After that, only re-entries pre-position.
+            was_in_kiosk: false,
         }
     }
 }
@@ -839,19 +849,33 @@ fn engine_tick_system(
         }
     }
 
-    // Apply the predicted cursor ONLY when the user hasn't just acted —
-    // deliberate D-pad nav must dominate the auto-prediction. Also
-    // compute the ribbon offer now (Slice 3e) — the engine gates
-    // confidence per the host-supplied resume title.
+    // Apply the predicted cursor ONLY on engine-state transition INTO
+    // Kiosk (from Off/Ambient/Content). The Slice 3a hint design
+    // (design hub § 13.7) is "stable frame, context-filled":
+    // pre-position the cursor when the user RETURNS, not on every
+    // non-fresh frame nor at arbitrary idle timeouts (both of which
+    // make the cursor snap-back while user is just viewing the menu).
+    //
+    // The prior implementation (commits 10d8da8/2e00198) overwrote
+    // the user's D-pad nav within ~16 ms (next frame after press),
+    // creating a visible "snap-back to Lights/Watch" bug noticed
+    // 2026-05-21 first-bedroom-test ("It resets to 'the start'
+    // every few seconds?!").
+    //
+    // Tracking previous_state via a static is heavy; using a single
+    // flag on EngineRes is the clean fix.
     let title_for_hint = engine_res.ha_ribbon_title.clone();
     let hint = engine_res
         .engine
         .hint_with_offer(&inputs, title_for_hint.as_deref());
-    if !fresh {
+    let just_entered_kiosk =
+        matches!(outcome.state, DisplayState::Kiosk) && !engine_res.was_in_kiosk;
+    if just_entered_kiosk {
         if let Some(predicted) = hint.cursor {
             engine_res.cursor = predicted;
         }
     }
+    engine_res.was_in_kiosk = matches!(outcome.state, DisplayState::Kiosk);
     // Cache the computed ribbon for the render system. We store the
     // String rather than the `RibbonOffer` to keep the EngineRes free
     // of `crate::context` re-exports beyond what's already used.
