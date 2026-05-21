@@ -73,6 +73,28 @@ const BG_FIT_WIDTH: f32 = 1920.0;
 const BG_FIT_HEIGHT: f32 = 3063.0;
 const BG_OPACITY: f32 = 0.20;
 
+// ─── Sidebar wood-panel background (mirrors Sarpetorp dashboard
+// INOMHUS widget, App.tsx:97). The dashboard's 0.12 opacity sits on a
+// light glass-card surface; here the underlying FOREST_BG is much
+// darker, so we need higher opacity for the wood to read at all while
+// preserving a "green-faded" appearance per Fredrik 2026-05-21.
+//
+// 2026-05-21 lessons stacked on Bevy 0.18 ImageNode:
+// 1. `NodeImageMode::Auto` (default) renders the image at its NATURAL
+//    pixel dimensions and IGNORES the Node's width/height for sizing.
+// 2. `NodeImageMode::Stretch` SHOULD stretch to Node bounds but
+//    empirically overshoots slightly on Mali Panfrost (observed ~11 px
+//    right overlap + ~73 px short vertically, screenshot 2026-05-21).
+// Workaround: pre-resize the asset to EXACTLY the sidebar dimensions
+// (sips → 540×1080) so Auto mode renders 1:1 with the Node — no stretch
+// math, no rendering quirks. The intermediate portrait crop is kept for
+// reference but the in-binary include points at the 540×1080 final. ──
+const SIDEBAR_WOOD_IMAGE: &[u8] =
+    include_bytes!("../assets/backgrounds/wood-panel-bg-540x1080.jpg");
+const SIDEBAR_WIDTH: f32 = 540.0;
+const SIDEBAR_HEIGHT: f32 = 1080.0;
+const SIDEBAR_OPACITY: f32 = 0.40;
+
 // ─── Lucide codepoints for the six menu tiles ────────────────────────
 const ICON_GAMES: char = '\u{e0df}'; // gamepad-2
 const ICON_MUSIC: char = '\u{e122}'; // music
@@ -288,19 +310,32 @@ fn preview_for(item: MenuItem) -> (char, &'static str, &'static str) {
 
 fn main() {
     App::new()
-        .insert_resource(WinitSettings {
-            focused_mode: bevy::winit::UpdateMode::Reactive {
-                wait: Duration::from_millis(33),
-                react_to_device_events: true,
-                react_to_user_events: true,
-                react_to_window_events: true,
-            },
-            unfocused_mode: bevy::winit::UpdateMode::Reactive {
-                wait: Duration::from_millis(33),
-                react_to_device_events: true,
-                react_to_user_events: true,
-                react_to_window_events: true,
-            },
+        .insert_resource({
+            // Latency diagnostic 2026-05-21: SHANNON_KIOSK_CONTINUOUS=1
+            // forces continuous-update mode (no 33ms wait floor) so we can
+            // A/B test whether Reactive wait is the dominant latency source.
+            // Safety: under May-20 freq caps (A53/A72 @ 1.008 GHz, GPU @ 400 MHz)
+            // continuous mode should NOT wedge the SoC like uncapped May-13 tests.
+            // Default (env unset) remains Reactive 33ms — production behavior.
+            if std::env::var("SHANNON_KIOSK_CONTINUOUS").is_ok() {
+                eprintln!("[shannon-kiosk] SHANNON_KIOSK_CONTINUOUS set — using continuous (game) mode");
+                WinitSettings::game()
+            } else {
+                WinitSettings {
+                    focused_mode: bevy::winit::UpdateMode::Reactive {
+                        wait: Duration::from_millis(33),
+                        react_to_device_events: true,
+                        react_to_user_events: true,
+                        react_to_window_events: true,
+                    },
+                    unfocused_mode: bevy::winit::UpdateMode::Reactive {
+                        wait: Duration::from_millis(33),
+                        react_to_device_events: true,
+                        react_to_user_events: true,
+                        react_to_window_events: true,
+                    },
+                }
+            }
         })
         .insert_resource(ClearColor(FOREST_BG))
         .insert_resource({
@@ -370,9 +405,19 @@ fn main() {
         .run();
 }
 
+/// Image handle for the sidebar wood-panel background. Loaded in
+/// setup_background, consumed by setup_ui's sidebar ImageNode spawn.
+#[derive(Resource)]
+struct SidebarBgHandle(Handle<Image>);
+
 fn setup_background(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
-    let image = Image::from_buffer(
+
+    // Global atmospheric background (full screen, deepest layer).
+    // The image is a deep red-burlap fabric texture from the Sarpetorp
+    // dashboard's clock widget; at 20% alpha over FOREST_BG it adds warmth
+    // throughout the scene without dominating any zone.
+    let clock_image = Image::from_buffer(
         BG_IMAGE,
         ImageType::Extension("jpg"),
         CompressedImageFormats::NONE,
@@ -381,16 +426,31 @@ fn setup_background(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         RenderAssetUsages::default(),
     )
     .expect("Sarpetorp clock-bg.jpg decodes");
-    let handle = images.add(image);
+    let clock_handle = images.add(clock_image);
     commands.spawn((
         Sprite {
-            image: handle,
+            image: clock_handle,
             custom_size: Some(Vec2::new(BG_FIT_WIDTH, BG_FIT_HEIGHT)),
             color: Color::srgba(1.0, 1.0, 1.0, BG_OPACITY),
             ..default()
         },
         Transform::from_xyz(0.0, 0.0, -1.0),
     ));
+
+    // Load the sidebar wood-panel image; the actual rendering is done in
+    // setup_ui as a UI ImageNode (top-left-origin coords are unambiguous
+    // for the sidebar zone, and a clipping parent gives proper cover-fit).
+    let wood_image = Image::from_buffer(
+        SIDEBAR_WOOD_IMAGE,
+        ImageType::Extension("jpg"),
+        CompressedImageFormats::NONE,
+        true,
+        ImageSampler::Default,
+        RenderAssetUsages::default(),
+    )
+    .expect("wood-panel-bg.jpg decodes");
+    let wood_handle = images.add(wood_image);
+    commands.insert_resource(SidebarBgHandle(wood_handle));
 }
 
 fn load_fonts(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
@@ -407,36 +467,44 @@ fn load_fonts(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
     });
 }
 
-fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
+fn setup_ui(
+    mut commands: Commands,
+    fonts: Res<FontHandles>,
+    sidebar_bg: Res<SidebarBgHandle>,
+) {
     commands.spawn(Camera2d);
 
+    // ─── Sidebar wood-panel background ────────────────────────────────
+    // Image asset is pre-resized to EXACTLY 540×1080 (sips), matching the
+    // sidebar Node bounds 1:1. Use NodeImageMode::Auto (default) so the
+    // image renders at its natural dimensions — no Stretch quirks, no
+    // overshoot, no short-fall. UI coords top-left-origin. Negative
+    // GlobalZIndex pins behind menu text / chrome / preview UI.
+    commands.spawn((
+        ImageNode {
+            image: sidebar_bg.0.clone(),
+            color: Color::srgba(1.0, 1.0, 1.0, SIDEBAR_OPACITY),
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(0.0),
+            left: Val::Px(0.0),
+            width: Val::Px(SIDEBAR_WIDTH),
+            height: Val::Px(SIDEBAR_HEIGHT),
+            ..default()
+        },
+        GlobalZIndex(-10),
+    ));
+
     // Six-tile vertical menu — left side, generous vertical spacing.
+    // Per Fredrik 2026-05-21: no cursor marker — the OAT_MILK vs OAT_DIM
+    // text-color contrast is sufficient to indicate selection. The
+    // MenuCursorMarker type stays around (menu_render_system still
+    // queries it; the empty iter just no-ops).
     for (i, tile) in MENU.iter().enumerate() {
         let y = 240.0 + (i as f32 * 88.0);
         let label_color = if i == 0 { OAT_MILK } else { OAT_DIM };
-
-        // Cursor marker (▸) — visible only on the selected tile
-        commands.spawn((
-            Text::new("▸"),
-            TextFont {
-                font: fonts.bold.clone(),
-                font_size: 32.0,
-                ..default()
-            },
-            TextColor(AMBER_ACCENT),
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(y),
-                left: Val::Px(86.0),
-                ..default()
-            },
-            if i == 0 {
-                Visibility::Visible
-            } else {
-                Visibility::Hidden
-            },
-            MenuCursorMarker { index: i },
-        ));
 
         // Lucide icon
         commands.spawn((
@@ -548,15 +616,26 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
         PreviewElement::Subtitle,
     ));
 
-    // Controller chrome bar — bottom strip, text-only for now.
+    // Controller chrome — vertical stack near the bottom of the sidebar,
+    // shifted leftward to align with the menu's icon/label column structure
+    // (per Fredrik 2026-05-21: "adjust the btn legend like 20% to the left
+    // within the menu sidebar"). Glyph column matches menu icon column
+    // (x = 130), label column matches roughly halfway between menu icon
+    // and label (x = 175). Visually the chrome rows now read as
+    // mini-menu-rows: glyph then label, sharing left-margin discipline
+    // with the menu above.
     let chrome_specs = [
         ("A", "SELECT", AMBER_ACCENT),
         ("B", "BACK", OAT_DIM),
         ("Y", "ALL OFF", OAT_DIM),
     ];
-    let chrome_y = 1010.0;
+    let chrome_y_start = 920.0;
+    let chrome_row_gap = 45.0;
+    let chrome_glyph_x = 130.0;
+    let chrome_label_x = 175.0;
     for (i, (button, label, color)) in chrome_specs.iter().enumerate() {
-        let x = 120.0 + (i as f32 * 260.0);
+        let y = chrome_y_start + (i as f32 * chrome_row_gap);
+        // Button glyph — bold, glyph column
         commands.spawn((
             Text::new(button.to_string()),
             TextFont {
@@ -567,11 +646,12 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
             TextColor(*color),
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(chrome_y),
-                left: Val::Px(x),
+                top: Val::Px(y),
+                left: Val::Px(chrome_glyph_x),
                 ..default()
             },
         ));
+        // Action label — semibold, label column
         commands.spawn((
             Text::new(label.to_string()),
             TextFont {
@@ -582,8 +662,8 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>) {
             TextColor(OAT_FAINT),
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(chrome_y + 6.0),
-                left: Val::Px(x + 36.0),
+                top: Val::Px(y + 4.0), // slight downshift to align baselines
+                left: Val::Px(chrome_label_x),
                 ..default()
             },
         ));
@@ -700,9 +780,13 @@ fn gamepad_event_system(
                 } else {
                     cursor_idx - 1
                 };
+                // Latency diagnostic 2026-05-21: pair vs evtest /dev/input/event1
+                // kernel-arrival timestamp to measure kernel→Bevy delivery.
+                info!("DPadUp: cursor_idx={}", cursor_idx);
             }
             GamepadButton::DPadDown => {
                 cursor_idx = (cursor_idx + 1) % n;
+                info!("DPadDown: cursor_idx={}", cursor_idx);
             }
             GamepadButton::South => {
                 info!("Selected: {:?}", MENU[cursor_idx].item);
@@ -787,6 +871,13 @@ fn engine_tick_system(
     let fresh = engine_res.fresh_controller_input;
     let manual_press = engine_res.manual_press.take();
     engine_res.fresh_controller_input = false;
+
+    // Latency diagnostic 2026-05-21: fires ONLY when there was fresh input
+    // this tick. Pair with the DPad info! lines + menu_render_system info!
+    // to compute the full input→render chain timing.
+    if fresh {
+        info!("engine_tick: fresh=true");
+    }
 
     engine_res.since_input += time.delta();
 
@@ -981,6 +1072,7 @@ fn current_local_minutes() -> ClockMinutes {
 
 fn menu_render_system(
     engine_res: Res<EngineRes>,
+    mut prev_selected: Local<Option<usize>>,
     mut label_q: Query<(&mut TextColor, &MenuLabel), Without<MenuIcon>>,
     mut icon_q: Query<(&mut TextColor, &MenuIcon), Without<MenuLabel>>,
     mut cursor_q: Query<(&mut Visibility, &MenuCursorMarker)>,
@@ -989,6 +1081,16 @@ fn menu_render_system(
         return;
     }
     let selected = menu_index_of(engine_res.cursor);
+    // Latency diagnostic 2026-05-21: log only when the rendered selection
+    // index actually changes (engine_res is_changed fires every tick because
+    // engine_tick_system takes ResMut — without this guard we'd flood at 30Hz).
+    if Some(selected) != *prev_selected {
+        info!(
+            "menu_render: cursor={:?} selected={} (was {:?})",
+            engine_res.cursor, selected, *prev_selected
+        );
+        *prev_selected = Some(selected);
+    }
 
     for (mut color, label) in label_q.iter_mut() {
         color.0 = if label.index == selected {
