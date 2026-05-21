@@ -1063,15 +1063,53 @@ fn gamepad_event_system(
                 MenuLevel::Root => {
                     let item = MENU[cursor_idx].item;
                     info!("Selected: {:?}", item);
-                    // A on LIGHTS opens the group submenu (Fredrik
-                    // 2026-05-21). Other tiles' actions are placeholders
-                    // until each gets wired (Games, Music, Watch,
-                    // Sensors, Sleep — open items table).
-                    if item == MenuItem::Lights {
-                        engine_res.menu_level = MenuLevel::LightsSubmenu;
-                        engine_res.submenu_cursor = 0;
-                        cursor_idx = 0;
-                        info!("Enter LightsSubmenu (cursor=0=bedroom)");
+                    match item {
+                        MenuItem::Lights => {
+                            // A on LIGHTS opens the group submenu
+                            // (Fredrik 2026-05-21).
+                            engine_res.menu_level = MenuLevel::LightsSubmenu;
+                            engine_res.submenu_cursor = 0;
+                            cursor_idx = 0;
+                            info!("Enter LightsSubmenu (cursor=0=bedroom)");
+                        }
+                        MenuItem::Sleep => {
+                            // A on SLEEP = bedroom wind-down (Fredrik
+                            // 2026-05-21 afternoon, Lights-before-Games
+                            // sequencing): engine ForceOff (TV blackout
+                            // via BlackoutTvPower) AND all-lights-off
+                            // for bedroom + office. Different from Y
+                            // (North) which is engine-state-only via
+                            // Manual::ForceOff — Sleep adds the lights
+                            // kill so "bedroom going to sleep" is a
+                            // single deliberate affordance. Hallway
+                            // stays automation-driven (presence-service
+                            // handles it). The same X_ALL_TOGGLE_GROUPS
+                            // const drives both the X-toggle and the
+                            // Sleep-off path so the "what's a light to
+                            // the kiosk" SSoT is one place.
+                            info!(
+                                "Sleep: ForceOff engine + all lights off ({:?})",
+                                X_ALL_TOGGLE_GROUPS
+                            );
+                            engine_res.manual_press = Some(Manual::ForceOff);
+                            try_dispatch_lights_multi(
+                                &mut engine_res,
+                                &daemon_url,
+                                X_ALL_TOGGLE_GROUPS,
+                                "off",
+                            );
+                        }
+                        // Other tiles (Games, Music, Watch, Sensors):
+                        // South-arm wiring pending per the kiosk plan's
+                        // tile-action roadmap. Games = RetroArch launch
+                        // (needs cage process-model research); Music =
+                        // HA media_player.spotify or spotifyd-direct
+                        // (entity confirmation pending); Watch = Phase-7
+                        // spela-local handoff (Session B is wiring the
+                        // daemon /watch endpoint + the South-arm
+                        // dispatch); Sensors = preview-pane redesign
+                        // (render-system, not an action).
+                        _ => {}
                     }
                 }
                 MenuLevel::LightsSubmenu => {
