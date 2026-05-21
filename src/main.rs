@@ -242,6 +242,15 @@ struct EngineRes {
     /// `LIGHTS_DEBOUNCE_MS`; faster presses are logged + dropped. HA's
     /// own toggle round-trip is the floor on perceivable speed anyway.
     last_lights_action_at: Option<std::time::Instant>,
+    /// Timestamp of the last Watch dispatch (POST /watch → daemon spawns
+    /// `spela-local`) — separate debounce field from lights because a
+    /// Watch action kicks off a long-lived playback pipeline (search →
+    /// Darwin NVENC cold-start → mpv launch under cage) whose
+    /// cost-of-double-press is far higher than a lights toggle. Capped
+    /// at `WATCH_DEBOUNCE_MS` (2 s) so two rapid A-presses don't fire
+    /// two parallel spela-locals — Darwin spela serves one stream at a
+    /// time; duplicate triggers would race the stream-replacement path.
+    last_watch_action_at: Option<std::time::Instant>,
 }
 
 /// One snapshot of HA state from the daemon's /ha-state endpoint.
@@ -289,6 +298,7 @@ impl Default for EngineRes {
             menu_level: MenuLevel::Root,
             submenu_cursor: 0,
             last_lights_action_at: None,
+            last_watch_action_at: None,
         }
     }
 }
@@ -629,6 +639,83 @@ fn try_dispatch_lights_multi(
 /// kiosk-known group. See `ha.rs::HaConfig::light_groups` for the
 /// codified principle.
 const X_ALL_TOGGLE_GROUPS: &[&str] = &["bedroom", "office"];
+
+/// Debounce window for Watch dispatch (Phase-7 spela-thin-client
+/// Layer-4b). Far longer than `LIGHTS_DEBOUNCE_MS` because a Watch
+/// action kicks off a long playback pipeline; pressing A twice in
+/// quick succession should not fire two spela-locals (Darwin spela
+/// serves one stream at a time — duplicate triggers race the
+/// stream-replacement path). 2 s is generous enough for "did it
+/// register?" double-presses without imposing perceptible lag.
+const WATCH_DEBOUNCE_MS: u64 = 2000;
+
+/// Default smoke-test title for the Watch tile (Phase-7 Layer-4b v1).
+/// Fredrik's canonical spela search example — used throughout spela
+/// docs as `spela search "Good Luck Have Fun Dont Die"`. Hardcoded for
+/// first-light; the title-picker UX (resume-last vs context-engine
+/// vs in-Bevy search per kiosk research § 7 Ranks 1+7) is a separate
+/// arc. To override before that arc lands: flip this const and
+/// rebuild.
+const WATCH_SMOKE_TITLE: &str = "Good Luck Have Fun Dont Die";
+
+/// Fire-and-forget POST to the daemon's `/watch` endpoint with a JSON
+/// body `{"title": "<query>"}`. The daemon's `watch_handler` returns
+/// 202 immediately after spawning `spela-local <title>` detached, so
+/// this call clears in <50 ms; the actual playback pipeline (Darwin
+/// transcode cold-start + cage/mpv launch) runs server-side.
+///
+/// Mirrors `spawn_daemon_lights_post`'s shape — short-lived
+/// std::thread + reqwest::blocking with a 5s timeout, never blocks the
+/// Bevy main loop. Thread-spawn failures (EAGAIN under load) are
+/// logged + dropped rather than panicking.
+fn spawn_daemon_watch_post(daemon_url: String, title: String) {
+    let result = std::thread::Builder::new()
+        .name(format!("daemon-post-watch-{}", title.replace(' ', "-")))
+        .spawn(move || {
+            let url = format!("{}/watch", daemon_url.trim_end_matches('/'));
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("daemon-post-watch: client build failed: {e}");
+                    return;
+                }
+            };
+            let body = serde_json::json!({ "title": title });
+            match client.post(&url).json(&body).send() {
+                Ok(resp) => info!(
+                    "daemon POST {} (title={:?}) → {}",
+                    url,
+                    title,
+                    resp.status()
+                ),
+                Err(e) => warn!("daemon POST {} (title={:?}) failed: {}", url, title, e),
+            }
+        });
+    if let Err(e) = result {
+        warn!("daemon-post-watch: thread spawn failed (resource limit?): {e}");
+    }
+}
+
+/// Debounced dispatch helper for Watch. Returns true if the request
+/// was sent, false if throttled (within `WATCH_DEBOUNCE_MS` of the
+/// previous dispatch). Wraps `spawn_daemon_watch_post` so the
+/// match-arm call site stays one line. Separate debounce field
+/// (`last_watch_action_at`) from lights — see field doc for why.
+fn try_dispatch_watch(engine_res: &mut EngineRes, daemon_url: &DaemonUrl, title: &str) -> bool {
+    let now = std::time::Instant::now();
+    if let Some(last) = engine_res.last_watch_action_at {
+        if now.duration_since(last) < Duration::from_millis(WATCH_DEBOUNCE_MS) {
+            info!("watch {:?} throttled (rapid press)", title);
+            return false;
+        }
+    }
+    engine_res.last_watch_action_at = Some(now);
+    spawn_daemon_watch_post(daemon_url.0.clone(), title.to_string());
+    true
+}
 
 fn setup_background(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
@@ -1099,16 +1186,51 @@ fn gamepad_event_system(
                                 "off",
                             );
                         }
-                        // Other tiles (Games, Music, Watch, Sensors):
-                        // South-arm wiring pending per the kiosk plan's
-                        // tile-action roadmap. Games = RetroArch launch
-                        // (needs cage process-model research); Music =
-                        // HA media_player.spotify or spotifyd-direct
-                        // (entity confirmation pending); Watch = Phase-7
-                        // spela-local handoff (Session B is wiring the
-                        // daemon /watch endpoint + the South-arm
-                        // dispatch); Sensors = preview-pane redesign
-                        // (render-system, not an action).
+                        MenuItem::Watch => {
+                            // A on WATCH fires the Phase-7 spela-thin-
+                            // client (Session B 2026-05-21): POST /watch
+                            // → daemon spawns `spela-local <title>` →
+                            // Darwin spela NVENC-transcodes H.264 1080p
+                            // HLS → Shannon mpv decodes (currently SW;
+                            // patched mpv via apt.undo.it for
+                            // --hwdec=drm is the Layer-2 follow-up).
+                            // Debounced (`try_dispatch_watch`) at 2 s
+                            // so two rapid presses don't fire two
+                            // parallel spela-locals (Darwin spela
+                            // serves one stream at a time).
+                            //
+                            // V1 uses a hardcoded smoke title
+                            // (`WATCH_SMOKE_TITLE`); the title-picker
+                            // UX (resume-last vs context-engine vs
+                            // in-Bevy search per kiosk research § 7
+                            // Ranks 1+7) is a separate arc.
+                            //
+                            // Scanout-handoff caveat: stock spela-local
+                            // launches mpv with --vo=drm, which
+                            // conflicts with cage's hold on
+                            // /dev/dri/card0. First-light through this
+                            // button currently requires either (a) the
+                            // kiosk service stopped manually, or (b)
+                            // the patched-mpv + dmabuf-wayland +
+                            // shannon-mode handoff work that lands in
+                            // the cluster of Phase-7 follow-ups
+                            // (Layer-1 cage + Layer-2 patched mpv).
+                            // The daemon /watch route + this button
+                            // wiring are the ARCHITECTURAL touchpoint;
+                            // the handoff is the COMPOSITION question.
+                            info!("Watch: dispatching {:?}", WATCH_SMOKE_TITLE);
+                            try_dispatch_watch(&mut engine_res, &daemon_url, WATCH_SMOKE_TITLE);
+                        }
+                        // Other tiles (Games, Music, Sensors): South-
+                        // arm wiring pending per the kiosk plan's
+                        // tile-action roadmap. Games = RetroArch
+                        // launch (needs cage process-model research);
+                        // Music = HA media_player.fredrik (the
+                        // spotifyd Spotify-Connect entity on Shannon)
+                        // via a new daemon `/media/<entity>/<action>`
+                        // endpoint (Session A's territory when wired);
+                        // Sensors = preview-pane redesign (render-
+                        // system, not an action).
                         _ => {}
                     }
                 }
