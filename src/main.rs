@@ -149,6 +149,42 @@ fn menu_index_of(item: MenuItem) -> usize {
         .expect("MENU must contain every MenuItem variant")
 }
 
+// ─── Lights submenu (Fredrik 2026-05-21: A on LIGHTS opens a group
+// picker; A on a group toggles it; B returns to root). ──────────────
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuLevel {
+    #[default]
+    Root,
+    LightsSubmenu,
+}
+
+struct SubmenuTile {
+    /// Kiosk-group name passed to the daemon's /lights/:group/:action.
+    /// Must be a key in `HaConfig::light_groups` on the daemon side
+    /// (bedroom / office / hallway in the current config).
+    group: &'static str,
+    label: &'static str,
+    icon: char,
+}
+
+const LIGHTS_SUBMENU: &[SubmenuTile] = &[
+    SubmenuTile {
+        group: "bedroom",
+        label: "BEDROOM",
+        icon: ICON_LIGHTS,
+    },
+    SubmenuTile {
+        group: "office",
+        label: "OFFICE",
+        icon: ICON_LIGHTS,
+    },
+    SubmenuTile {
+        group: "hallway",
+        label: "HALLWAY",
+        icon: ICON_LIGHTS,
+    },
+];
+
 // ─── Bevy resources ──────────────────────────────────────────────────
 
 #[derive(Resource)]
@@ -190,6 +226,22 @@ struct EngineRes {
     /// (from Off/Ambient/Content), not every non-fresh frame nor on
     /// an arbitrary idle timeout. The "snap-back" bug fix.
     was_in_kiosk: bool,
+    /// Current menu level — Root shows the 6-tile main menu; LightsSubmenu
+    /// shows the 3 light groups (bedroom/office/hallway). Transitions:
+    /// A on cursor=Lights at Root → LightsSubmenu (saved_root_cursor =
+    /// Lights). B at LightsSubmenu → Root (cursor restored). Exit-Kiosk
+    /// resets to Root (don't carry submenu state across visibility gaps).
+    menu_level: MenuLevel,
+    /// Cursor index within the current submenu (0..LIGHTS_SUBMENU.len()
+    /// when menu_level == LightsSubmenu; unused at Root).
+    submenu_cursor: usize,
+    /// Timestamp of the last lights-toggle dispatch — used to debounce
+    /// rapid presses (Fredrik 2026-05-21: barrage of X crashed the
+    /// kiosk by exhausting thread/runtime resources in
+    /// `spawn_daemon_lights_post`). Caps dispatch rate to ~1 per
+    /// `LIGHTS_DEBOUNCE_MS`; faster presses are logged + dropped. HA's
+    /// own toggle round-trip is the floor on perceivable speed anyway.
+    last_lights_action_at: Option<std::time::Instant>,
 }
 
 /// One snapshot of HA state from the daemon's /ha-state endpoint.
@@ -234,6 +286,9 @@ impl Default for EngineRes {
             // Kiosk (from initial Off state) fires the cursor pre-
             // position. After that, only re-entries pre-position.
             was_in_kiosk: false,
+            menu_level: MenuLevel::Root,
+            submenu_cursor: 0,
+            last_lights_action_at: None,
         }
     }
 }
@@ -255,8 +310,25 @@ struct MenuIcon {
     index: usize,
 }
 
+/// Legacy marker — cursor markers were removed 2026-05-21 (per Fredrik
+/// the text-color contrast is sufficient selection indicator). No
+/// entities are spawned with this; menu_render_system still includes
+/// an empty-iter query for trivial future re-introduction.
 #[derive(Component)]
-struct MenuCursorMarker {
+struct MenuCursorMarker;
+
+/// Marker for the Lights submenu's icon entities (spawned alongside the
+/// root menu icons at the same y positions; visibility flipped by
+/// menu_render_system based on engine_res.menu_level).
+#[derive(Component)]
+struct LightsSubmenuIcon {
+    index: usize,
+}
+
+/// Marker for the Lights submenu's label entities (BEDROOM / OFFICE /
+/// HALLWAY). Paired with LightsSubmenuIcon — sibling visibility.
+#[derive(Component)]
+struct LightsSubmenuLabel {
     index: usize,
 }
 
@@ -425,6 +497,14 @@ struct SidebarBgHandle(Handle<Image>);
 #[derive(Resource, Clone)]
 struct DaemonUrl(String);
 
+/// Debounce window for lights-toggle dispatch. Caps the rate at which
+/// the X-button (and Lights submenu A) can fire daemon POSTs. Each call
+/// spawns a thread + reqwest tokio runtime that holds for the HA toggle
+/// round-trip; barraging without a debounce piles up threads until
+/// `pthread_create` returns EAGAIN and the kiosk panics. 300 ms is also
+/// the floor on what the user can perceive as a separate light change.
+const LIGHTS_DEBOUNCE_MS: u64 = 300;
+
 /// Fire-and-forget POST to the daemon's `/lights/:group/:action`. Used by
 /// the X-button bedroom-quick-toggle (Fredrik 2026-05-21: *"X when Lights
 /// is selected (or really why not regardless of choice) can be a quick
@@ -433,8 +513,14 @@ struct DaemonUrl(String);
 /// timeout — never blocks the Bevy main loop. Result is logged but no
 /// retry / no callback; the daemon already has its own retry semantics
 /// for HA failures (see ha_state_poll_loop for the pattern this mirrors).
+///
+/// Thread spawn failures (EAGAIN under load) are logged and dropped —
+/// the previous `.expect` panicked the Bevy main thread, which is how a
+/// rapid-fire X barrage crashed the kiosk on 2026-05-21. Callers should
+/// rate-limit via `try_dispatch_lights` rather than calling this
+/// directly.
 fn spawn_daemon_lights_post(daemon_url: String, group: String, action: String) {
-    std::thread::Builder::new()
+    let result = std::thread::Builder::new()
         .name(format!("daemon-post-lights-{group}-{action}"))
         .spawn(move || {
             let url = format!(
@@ -457,8 +543,36 @@ fn spawn_daemon_lights_post(daemon_url: String, group: String, action: String) {
                 Ok(resp) => info!("daemon POST {} → {}", url, resp.status()),
                 Err(e) => warn!("daemon POST {} failed: {}", url, e),
             }
-        })
-        .expect("spawn daemon-post thread");
+        });
+    if let Err(e) = result {
+        // Resource exhaustion (EAGAIN/ENOMEM from pthread_create). Drop
+        // the action rather than panic — the user can press again.
+        warn!("daemon-post: thread spawn failed (resource limit?): {e}");
+    }
+}
+
+/// Debounced dispatch helper. Returns true if the toggle was sent;
+/// false if throttled (within `LIGHTS_DEBOUNCE_MS` of the previous
+/// dispatch). Wraps `spawn_daemon_lights_post` so every call site goes
+/// through the same gate — the crash on 2026-05-21 came from three
+/// independent call sites (X global toggle, Lights-submenu A, future
+/// per-tile X) sharing no rate limit.
+fn try_dispatch_lights(
+    engine_res: &mut EngineRes,
+    daemon_url: &DaemonUrl,
+    group: &str,
+    action: &str,
+) -> bool {
+    let now = std::time::Instant::now();
+    if let Some(last) = engine_res.last_lights_action_at {
+        if now.duration_since(last) < Duration::from_millis(LIGHTS_DEBOUNCE_MS) {
+            info!("lights {} {} throttled (rapid press)", group, action);
+            return false;
+        }
+    }
+    engine_res.last_lights_action_at = Some(now);
+    spawn_daemon_lights_post(daemon_url.0.clone(), group.to_string(), action.to_string());
+    true
 }
 
 fn setup_background(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
@@ -591,6 +705,48 @@ fn setup_ui(
                 ..default()
             },
             MenuLabel { index: i },
+        ));
+    }
+
+    // ─── Lights submenu (3 group tiles at the first 3 menu y positions).
+    // Hidden by default; menu_render_system flips visibility based on
+    // engine_res.menu_level. Pressing A on cursor=Lights at Root enters
+    // this submenu; B returns to Root. Per Fredrik 2026-05-21.
+    for (i, sub) in LIGHTS_SUBMENU.iter().enumerate() {
+        let y = 240.0 + (i as f32 * 88.0);
+        commands.spawn((
+            Text::new(sub.icon.to_string()),
+            TextFont {
+                font: fonts.lucide.clone(),
+                font_size: 40.0,
+                ..default()
+            },
+            TextColor(OAT_DIM),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(y - 4.0),
+                left: Val::Px(130.0),
+                ..default()
+            },
+            Visibility::Hidden,
+            LightsSubmenuIcon { index: i },
+        ));
+        commands.spawn((
+            Text::new(sub.label),
+            TextFont {
+                font: fonts.bold.clone(),
+                font_size: 34.0,
+                ..default()
+            },
+            TextColor(OAT_DIM),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(y),
+                left: Val::Px(200.0),
+                ..default()
+            },
+            Visibility::Hidden,
+            LightsSubmenuLabel { index: i },
         ));
     }
 
@@ -817,8 +973,13 @@ fn gamepad_event_system(
     mut engine_res: ResMut<EngineRes>,
     daemon_url: Res<DaemonUrl>,
 ) {
-    let n = MENU.len();
-    let mut cursor_idx = menu_index_of(engine_res.cursor);
+    // Snapshot the current cursor depending on which menu level is
+    // active. We work in usize-space inside this system and write back
+    // to engine_res.cursor / submenu_cursor at the end.
+    let (mut cursor_idx, n) = match engine_res.menu_level {
+        MenuLevel::Root => (menu_index_of(engine_res.cursor), MENU.len()),
+        MenuLevel::LightsSubmenu => (engine_res.submenu_cursor, LIGHTS_SUBMENU.len()),
+    };
 
     for ev in button_events.read() {
         if ev.value <= 0.5 {
@@ -835,18 +996,47 @@ fn gamepad_event_system(
                 };
                 // Latency diagnostic 2026-05-21: pair vs evtest /dev/input/event1
                 // kernel-arrival timestamp to measure kernel→Bevy delivery.
-                info!("DPadUp: cursor_idx={}", cursor_idx);
+                info!("DPadUp: level={:?} cursor_idx={}", engine_res.menu_level, cursor_idx);
             }
             GamepadButton::DPadDown => {
                 cursor_idx = (cursor_idx + 1) % n;
-                info!("DPadDown: cursor_idx={}", cursor_idx);
+                info!("DPadDown: level={:?} cursor_idx={}", engine_res.menu_level, cursor_idx);
             }
-            GamepadButton::South => {
-                info!("Selected: {:?}", MENU[cursor_idx].item);
-            }
-            GamepadButton::East => {
-                info!("Back");
-            }
+            GamepadButton::South => match engine_res.menu_level {
+                MenuLevel::Root => {
+                    let item = MENU[cursor_idx].item;
+                    info!("Selected: {:?}", item);
+                    // A on LIGHTS opens the group submenu (Fredrik
+                    // 2026-05-21). Other tiles' actions are placeholders
+                    // until each gets wired (Games, Music, Watch,
+                    // Sensors, Sleep — open items table).
+                    if item == MenuItem::Lights {
+                        engine_res.menu_level = MenuLevel::LightsSubmenu;
+                        engine_res.submenu_cursor = 0;
+                        cursor_idx = 0;
+                        info!("Enter LightsSubmenu (cursor=0=bedroom)");
+                    }
+                }
+                MenuLevel::LightsSubmenu => {
+                    // A on a group toggles its lights via the daemon.
+                    // Debounced — see try_dispatch_lights for the why.
+                    let group = LIGHTS_SUBMENU[cursor_idx].group;
+                    info!("Toggle lights group: {}", group);
+                    try_dispatch_lights(&mut engine_res, &daemon_url, group, "toggle");
+                }
+            },
+            GamepadButton::East => match engine_res.menu_level {
+                MenuLevel::Root => {
+                    info!("Back (no-op at Root)");
+                }
+                MenuLevel::LightsSubmenu => {
+                    // B exits submenu, restores root cursor on Lights.
+                    info!("Exit LightsSubmenu → Root (cursor restored to Lights)");
+                    engine_res.menu_level = MenuLevel::Root;
+                    engine_res.cursor = MenuItem::Lights;
+                    cursor_idx = menu_index_of(MenuItem::Lights);
+                }
+            },
             GamepadButton::North => {
                 engine_res.manual_press = Some(Manual::ForceOff);
                 info!("ALL OFF (engine ForceOff)");
@@ -855,13 +1045,12 @@ fn gamepad_event_system(
                 // X = quick toggle bedroom lights (Fredrik 2026-05-21).
                 // Fires regardless of which menu item is selected — a
                 // global shortcut. Reserved as a future "secondary
-                // action" slot per-tile when that lands.
+                // action" slot per-tile when that lands. Debounced via
+                // try_dispatch_lights — barraging X is what crashed the
+                // kiosk on the original 2026-05-21 session (thread/
+                // runtime exhaustion → pthread_create EAGAIN → panic).
                 info!("X: toggle bedroom lights");
-                spawn_daemon_lights_post(
-                    daemon_url.0.clone(),
-                    "bedroom".to_string(),
-                    "toggle".to_string(),
-                );
+                try_dispatch_lights(&mut engine_res, &daemon_url, "bedroom", "toggle");
             }
             _ => {}
         }
@@ -886,7 +1075,11 @@ fn gamepad_event_system(
         }
     }
 
-    engine_res.cursor = MENU[cursor_idx].item;
+    // Write back the final cursor to the level-appropriate field.
+    match engine_res.menu_level {
+        MenuLevel::Root => engine_res.cursor = MENU[cursor_idx].item,
+        MenuLevel::LightsSubmenu => engine_res.submenu_cursor = cursor_idx,
+    }
 }
 
 fn keyboard_event_system(
@@ -925,12 +1118,9 @@ fn keyboard_event_system(
     }
     if keys.just_pressed(KeyCode::KeyX) {
         // Mirrors Xbox X button — bedroom-toggle global shortcut.
+        // Debounced via the same path as the gamepad West handler.
         info!("X (keyboard): toggle bedroom lights");
-        spawn_daemon_lights_post(
-            daemon_url.0.clone(),
-            "bedroom".to_string(),
-            "toggle".to_string(),
-        );
+        try_dispatch_lights(&mut engine_res, &daemon_url, "bedroom", "toggle");
         any_press = true;
     }
 
@@ -1044,6 +1234,12 @@ fn engine_tick_system(
         if let Some(predicted) = hint.cursor {
             engine_res.cursor = predicted;
         }
+        // Reset submenu state on Kiosk re-entry — don't strand the user
+        // in a stale Lights submenu after the screen had been off /
+        // ambient. Pairing with the snap-back fix's discipline of
+        // "context-fill on RETURN" (design § 13.7).
+        engine_res.menu_level = MenuLevel::Root;
+        engine_res.submenu_cursor = 0;
     }
     engine_res.was_in_kiosk = matches!(outcome.state, DisplayState::Kiosk);
     // Cache the computed ribbon for the render system. We store the
@@ -1149,47 +1345,104 @@ fn current_local_minutes() -> ClockMinutes {
     ClockMinutes::at(minutes_of_day / 60, minutes_of_day % 60)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn menu_render_system(
     engine_res: Res<EngineRes>,
     mut prev_selected: Local<Option<usize>>,
-    mut label_q: Query<(&mut TextColor, &MenuLabel), Without<MenuIcon>>,
-    mut icon_q: Query<(&mut TextColor, &MenuIcon), Without<MenuLabel>>,
-    mut cursor_q: Query<(&mut Visibility, &MenuCursorMarker)>,
+    mut root_label_q: Query<
+        (&mut TextColor, &mut Visibility, &MenuLabel),
+        (Without<MenuIcon>, Without<LightsSubmenuLabel>, Without<LightsSubmenuIcon>),
+    >,
+    mut root_icon_q: Query<
+        (&mut TextColor, &mut Visibility, &MenuIcon),
+        (Without<MenuLabel>, Without<LightsSubmenuLabel>, Without<LightsSubmenuIcon>),
+    >,
+    mut cursor_q: Query<(&mut Visibility, &MenuCursorMarker), (Without<MenuLabel>, Without<MenuIcon>, Without<LightsSubmenuLabel>, Without<LightsSubmenuIcon>)>,
+    mut sub_label_q: Query<
+        (&mut TextColor, &mut Visibility, &LightsSubmenuLabel),
+        (Without<MenuLabel>, Without<MenuIcon>, Without<LightsSubmenuIcon>),
+    >,
+    mut sub_icon_q: Query<
+        (&mut TextColor, &mut Visibility, &LightsSubmenuIcon),
+        (Without<MenuLabel>, Without<MenuIcon>, Without<LightsSubmenuLabel>),
+    >,
 ) {
     if !engine_res.is_changed() {
         return;
     }
-    let selected = menu_index_of(engine_res.cursor);
+    let in_submenu = matches!(engine_res.menu_level, MenuLevel::LightsSubmenu);
+    let selected = if in_submenu {
+        engine_res.submenu_cursor
+    } else {
+        menu_index_of(engine_res.cursor)
+    };
+
     // Latency diagnostic 2026-05-21: log only when the rendered selection
     // index actually changes (engine_res is_changed fires every tick because
     // engine_tick_system takes ResMut — without this guard we'd flood at 30Hz).
     if Some(selected) != *prev_selected {
         info!(
-            "menu_render: cursor={:?} selected={} (was {:?})",
-            engine_res.cursor, selected, *prev_selected
+            "menu_render: level={:?} cursor={:?} selected={} (was {:?})",
+            engine_res.menu_level, engine_res.cursor, selected, *prev_selected
         );
         *prev_selected = Some(selected);
     }
 
-    for (mut color, label) in label_q.iter_mut() {
-        color.0 = if label.index == selected {
+    // Root menu: visible iff at Root level. Selection highlights cursor.
+    for (mut color, mut vis, label) in root_label_q.iter_mut() {
+        *vis = if in_submenu {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
+        color.0 = if label.index == selected && !in_submenu {
             OAT_MILK
         } else {
             OAT_DIM
         };
     }
-    for (mut color, icon) in icon_q.iter_mut() {
-        color.0 = if icon.index == selected {
+    for (mut color, mut vis, icon) in root_icon_q.iter_mut() {
+        *vis = if in_submenu {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
+        color.0 = if icon.index == selected && !in_submenu {
             OAT_MILK
         } else {
             OAT_DIM
         };
     }
-    for (mut vis, marker) in cursor_q.iter_mut() {
-        *vis = if marker.index == selected {
-            Visibility::Visible
+    for (mut vis, _marker) in cursor_q.iter_mut() {
+        // Cursor markers removed by design (Fredrik 2026-05-21) — no
+        // entities exist with MenuCursorMarker, but the query stays for
+        // backward compatibility / potential future re-introduction.
+        *vis = Visibility::Hidden;
+    }
+
+    // Lights submenu: inverse — visible iff at LightsSubmenu level.
+    for (mut color, mut vis, sub) in sub_label_q.iter_mut() {
+        *vis = if in_submenu {
+            Visibility::Inherited
         } else {
             Visibility::Hidden
+        };
+        color.0 = if sub.index == selected && in_submenu {
+            OAT_MILK
+        } else {
+            OAT_DIM
+        };
+    }
+    for (mut color, mut vis, sub) in sub_icon_q.iter_mut() {
+        *vis = if in_submenu {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        color.0 = if sub.index == selected && in_submenu {
+            OAT_MILK
+        } else {
+            OAT_DIM
         };
     }
 }
