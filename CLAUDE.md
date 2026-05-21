@@ -124,23 +124,49 @@ Bevy `WgpuSettings::priority=WebGL2` + custom limits keep us in the GLES 3.0/Web
 - `94ff1fd` Slice 3c step 1 — drop pixelated; Sarpetorp forest palette + Sharp Sans + Lucide + 6-tile menu + engine integration + Y=ForceOff
 - `5117b82` Slice 3c step 2 — bg image cover-fit at 20% + cursor-driven preview pane (huge Lucide icon + big label + dim subtitle per tile)
 
-### 🎉 May 21, 2026 — Slices 3d-3g SHIPPED + LIVE-VERIFIED on Shannon
+## Slices 3d-3g + Bevy 0.18 + Mali HW-GLES — architectural gates for future work
 
-4 commits adding the daemon HA polling + Bevy ribbon-offer wiring + BlackoutTvPower + Ambient/Off scene roots, plus a Shannon-side fix commit:
+Current stack on master: **Bevy 0.18.1 + wgpu 27 + vendored `wgpu-hal-27.0.4-mali-fix/` + Slices 3a–3g all in place + daemon running on Shannon**. Live-verified end-to-end (Mali-T860 Panfrost OpenGL ES 3.1 Mesa 25.0.7, daemon polling HA `last_poll_result: "ok"`, engine state machine transitions Off↔Ambient↔Kiosk on controller presence/idle). Future-session work touching this stack must preserve the load-bearing gates below.
 
-- `01b257f` Slice 3d — daemon HA polling: new `src/ha_poll.rs` (pure module, 10 tests) + `shannon-kiosk-actions` background tokio polling task + `GET /ha-state` endpoint. Polls `media_player.fredriks_tv` every `HA_POLL_INTERVAL_SECS` (default 30s) with exponential backoff up to 5min on failure.
-- `10d8da8` Slice 3e — ribbon-offer wiring: `Engine::hint_with_offer(&Inputs, Option<&str>)` engine API with confidence gates (6 tests). Bevy `std::thread` reqwest::blocking poller hits daemon's `/ha-state` every `HA_POLL_INTERVAL_SECS` (default 3s on Bevy side). Shared `Arc<Mutex<HaSnapshot>>` consumed in `engine_tick_system` via `try_lock` (non-blocking). New `RibbonLabel` UI element + `ribbon_render_system`. `Media` derives `Default`. Cargo: `reqwest blocking` feature.
-- `bb77d38` Slice 3f — `BlackoutTvPower` actuator (drop-in TvPower impl, 4 tests) + `BlackoutOverlay` full-screen black NodeBundle at `ZIndex::Global(500)` + `blackout_render_system`. Preserves Argon DA2 keepalive (no HDMI signal cut).
-- `27e2f23` Slice 3g — Ambient + Off scene roots: `AmbientCanvas` z=300 full-screen amber × engine brightness + `ambient_render_system`. Off scene reuses 3f blackout (engine `SetTvPower(false)` flips it on transition).
-- `0e42b67` Shannon-side panic fixes: `jpeg` Bevy feature + `zune-core = "=0.5.0-rc2"` pin (no stable 0.5.0 on crates.io) + bg JPG resized 3320×5299 → 2506×4000 to fit Mali's 4096 texture-dimension limit.
+### Critical gates (preserve, don't accidentally regress)
 
-**Live-verified 2026-05-21 ~23:48 CEST** on Shannon: cross-compile (3m15s, 31.5 MB binary) → scp deploy → 75s soak: `AdapterInfo { name: "Mali-T860 (Panfrost)", driver_info: "OpenGL ES 3.1 Mesa 25.0.7-2", backend: Gl }` ✓, `systemctl is-active = active`, load 0.17, CPU 45.6°C, zero panics. fb0-capture confirmed correct blackout rendering for engine's initial Off state. **62 tests total** (was 32 at session start), all green.
+**`wgpu/gles` feature flag** — `Cargo.toml`'s direct `wgpu = { version = "27", default-features = false, features = ["gles", "wgsl"] }` dep is what enables the GL backend on native Linux. Bevy 0.18's top-level `webgl2` maps to `wgpu/webgl` (WASM-only), NOT `wgpu/gles`. Removing this direct dep silently kills Mali HW-GLES on Shannon — `request_adapter` returns `None` in microseconds with zero `wgpu_hal::gles` traces, identical signature to "wgpu-hal init failure" but actually missing-feature-compile. Full root-cause arc: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` § 13.24 + `bedroom_kiosk_gpu_research_2026_05_06.md` § H.
 
-**Daemon not yet deployed**: `shannon-kiosk-actions` binary built + tested on Mac, NOT deployed to Shannon — gated on Fredrik's HA_TOKEN + entity_id config. Bevy poller silently retries connection-refused until daemon ships.
+**Cursor pre-positioning gates on engine state-transition INTO Kiosk** — `EngineRes.was_in_kiosk: bool` flag (`src/main.rs`) is checked in `engine_tick_system`; the predicted cursor from `engine.hint_with_offer(...).cursor` is applied ONLY on the tick that transitions Kiosk-from-elsewhere. Earlier versions applied it on every non-fresh frame, snapping the user's D-pad nav back to the morning-prediction tile (Lights) within ~16 ms — visible as "cursor resets to the start every few seconds." Fix commit `73499b4`; design-intent reference: design hub § 13.7 ("stable frame, context-filled" — pre-position on RETURN, not on every idle frame).
 
-**STILL DEFERRED (cosmetic only)**: Slice 3c step 3 (formal Xbox-styled colored circle chips for A/B/Y) — blocked on Bevy 0.14 lacking UI `border_radius`. The `bevy-upgrade` branch (Bevy 0.18.1) NOW unblocks this — see §"Bevy version" below.
+**Mali 4096 texture-dimension limit** — `WgpuLimits::downlevel_webgl2_defaults()` floor + `max_texture_dimension_2d=4096` cap in `src/main.rs`. Background asset `assets/backgrounds/sarpetorp-clock-bg.jpg` is sized 2506×4000 specifically to fit; the source from `~/Projects/sarpetorp/dashboard/public/clock-bg.jpg` is 3320×5299 and would panic `Device::create_texture: Dimension Y value 5299 exceeds the limit of 4096` if re-imported without resizing. Use macOS `sips -Z 4000 <src> --out <dst>` if re-sourcing.
 
-Full Slice 3d-3g arc: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` § 13.23.
+**`BlackoutTvPower` preserves Argon DA2 keepalive** — `Off` state paints the screen black via the `BlackoutOverlay` NodeBundle (`GlobalZIndex(500)`) rather than cutting HDMI signal. This is INTENTIONAL: the bedroom Argon amp's EU-EcoDesign auto-standby fires after ~10–20 min of HDMI-source silence; cutting the signal would force a 10-min cold-start the next time any audio (Ruby narration, music, spotifyd) plays. The opt-in `HdmiSignalTvPower` (`wlr-randr --output HDMI-A-1 --off`) and eventual `HaSmartPlugTvPower` paths remain alternatives for hosts without the Argon constraint. Design hub § 13.6.
+
+**HA polling lives in the daemon, not the kiosk** — `shannon-kiosk-actions` (binary at `/usr/local/bin/shannon-kiosk-actions` on Shannon, systemd unit `shannon-kiosk-actions.service`) is the only process that holds `HA_TOKEN`. The Bevy kiosk polls the daemon's `/ha-state` endpoint via `std::thread + reqwest::blocking` at 3 s cadence; the daemon polls HA every 30 s with exponential backoff up to 5 min on failure. The kiosk never talks to HA directly. `EnvironmentFile=-/etc/default/shannon-kiosk-actions` (mode 600 root) holds `HA_TOKEN` + entity-id overrides; deployed value sourced from `~/.secrets/tier-all.env` key `HA_TOKEN_SHANNON`.
+
+### Deferred architectural decisions (don't re-litigate without reading)
+
+**Ribbon-action wiring — Chromecast vs Shannon spela-launch** (Slice 3e ships the OFFER text; pressing [A] is currently a no-op that falls through to the menu's default A=select). Three options on the table:
+- **(a) HA `media_play` on Chromecast** — daemon POSTs `/api/services/media_player/media_play` with `entity_id: media_player.fredriks_tv`. The Chromecast resumes; the HDMI switch's auto-priority routing detects the active input + flips to that source. Simple, depends only on HA + existing Chromecast.
+- **(b) Launch `spela-local` on Shannon** — needs Slice 4's patched mpv landed first + a content-resolver mapping HA's reported title → spela magnet/file. Shannon's HDMI output becomes active; switch flips to Shannon input. More moving parts.
+- **(c) Both via different buttons** — A = Chromecast resume, X = play-on-Shannon. Defer until real-world taste decides.
+
+Fredrik's load-bearing intuition (verbatim 2026-05-21): *"either the Chromecast is playing thru the HDMI switch or the Shannon is. Pressing A to resume mostly makes sense for spela-on-Shannon and won't bring the Chromecast up? Or maybe it will because the HDMI Switch senses activity on that HDMI stream?"* — the **HDMI switch's auto-priority signal-detection** behavior is what makes option (a) viable without explicit input-select control. Defer the decision until a real Chromecast-paused-media taste-test surfaces preference. Design hub § 13.27 row 3.
+
+**Kiosk → daemon action wiring is NOT yet implemented** — pressing [A] on Lights / Music / Watch / Sensors / Sleep tiles currently logs only; no actuation. The daemon's `/lights/:group/:action` (Slice 2) is reachable for direct REST; wiring the kiosk's `gamepad_event_system` `GamepadButton::South` arm to POST when `engine_res.cursor == MenuItem::Lights` is ~15 lines + the cheapest first hookup. The engine's `Action::SetTvPower(_)` is already routed locally to `BlackoutTvPower` (`engine_tick_system`); routing it ALSO to the daemon for smart-plug actuation is a separate ~10-line addition (`reqwest::blocking::post` to a new daemon `/tv-power` endpoint or piggyback `/signal`).
+
+### Open items for next session
+
+| # | Item | Notes |
+|---|---|---|
+| 1 | **Input-to-render latency ~1 s** | Fredrik's fresh-eyes pick. First diagnostic: `RUST_LOG=bevy_render=info,bevy_winit=info` + check whether button events fire same-tick as emission. Suspects: `WinitSettings::Reactive { wait: 33 ms }` 30fps cap, gilrs polling cadence, render-system change-detection lag, cage/Xwayland event propagation. |
+| 2 | **Lights tile → daemon `/lights/:group/:action`** | Cheapest first hookup for actual menu actuation. |
+| 3 | **Y=ForceOff → daemon smart-plug** (or stay local-only via BlackoutTvPower) | Decide whether engine-emitted `Action::SetTvPower(_)` ALSO sends a daemon POST. Current behavior is local-blackout only (preserves Argon keepalive). |
+| 4 | **Ribbon-action wiring decision** | See deferred section above. |
+| 5 | **3 am artificial stress-test for 03:00 hard-hang** | Reduces wall-clock to confirm flaky-telemetry-cron mitigation. Methodology open. |
+| 6 | **Multi-hour soak + `systemctl enable shannon-display.service`** | Currently intentional manual-launch per critical-constraint #5. Flip when many-nights-stable. |
+| 7 | **Slice 3c step 3 — formal Xbox-styled colored chips** | Bevy 0.18+ ships UI `border_radius`; unblocked. Current text-only chrome ("A SELECT  B BACK  Y ALL OFF") works fine — cosmetic polish only. |
+| 8 | **Display fit on ultrawide** | `WindowResolution::new(1920, 1080)` is smaller than 3440×1440 dev monitor → right ~1/4 shows TTY framebuffer. Bedroom production is 1080p — fits perfectly there. |
+
+### Commit reference (for git archaeology when needed)
+
+Slice 3d–3g + merge + cursor fix sit on master: `01b257f` (3d daemon HA polling, new `src/ha_poll.rs`, 10 unit tests), `10d8da8` (3e ribbon-offer + Bevy poller + `Engine::hint_with_offer(...)` API, 6 unit tests, `Media: Default` derive, reqwest `blocking` feature), `bb77d38` (3f `BlackoutTvPower` + `BlackoutOverlay` + `blackout_render_system`, 4 unit tests), `27e2f23` (3g `AmbientCanvas` + `ambient_render_system`), `0e42b67` (jpeg + zune-core pin + bg jpg resize), `2e00198` (merge bevy-upgrade → master, conflicts resolved: Cargo.toml combine + Bevy 0.18 API translations applied to Slice 3d-3g new code), `73499b4` (cursor snap-back fix via `was_in_kiosk` state-transition gate). 62 lib + bin tests total, all green. Full chronology in design hub `§§ 13.23–13.27`.
 
 **Try it locally**: `cd ~/Projects/shannon-bedroom-kiosk && cargo run --bin shannon-kiosk`. With an Xbox controller paired over BT: D-pad / left stick to navigate, A select, B back, Y all-off. Without controller: the menu still renders (engine reports Off but menu UI is always-spawned at startup); a keyboard fallback for dev-without-Xbox is a candidate follow-up.
 
