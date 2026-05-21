@@ -251,6 +251,12 @@ struct EngineRes {
     /// two parallel spela-locals — Darwin spela serves one stream at a
     /// time; duplicate triggers would race the stream-replacement path.
     last_watch_action_at: Option<std::time::Instant>,
+    /// Timestamp of the last Music dispatch (POST /media → daemon HA
+    /// `media_player.media_play_pause`). Separate debounce field from
+    /// lights/watch — Music's HA round-trip is ~500 ms (audio backend
+    /// has its own response latency); rapid A-presses on the Music tile
+    /// would race the play↔pause flip. `MUSIC_DEBOUNCE_MS` matches.
+    last_media_action_at: Option<std::time::Instant>,
 }
 
 /// One snapshot of HA state from the daemon's /ha-state endpoint.
@@ -299,6 +305,7 @@ impl Default for EngineRes {
             submenu_cursor: 0,
             last_lights_action_at: None,
             last_watch_action_at: None,
+            last_media_action_at: None,
         }
     }
 }
@@ -714,6 +721,83 @@ fn try_dispatch_watch(engine_res: &mut EngineRes, daemon_url: &DaemonUrl, title:
     }
     engine_res.last_watch_action_at = Some(now);
     spawn_daemon_watch_post(daemon_url.0.clone(), title.to_string());
+    true
+}
+
+/// Music tile (`MenuItem::Music`) debounce window. Caps the rate at
+/// which the Music A-arm can fire daemon POSTs. HA's `media_player.*`
+/// services have ~500 ms response latency on the spotifyd Spotify-
+/// Connect path, so two rapid A-presses would race the play↔pause
+/// flip. 500 ms slightly above HA's typical reply, well below
+/// perceptible lag.
+const MUSIC_DEBOUNCE_MS: u64 = 500;
+
+/// Default Music entity key — kiosk identifier resolved by the daemon
+/// against `HaConfig::media_entities`. `"default"` maps to
+/// `media_player.fredrik` (spotifyd Spotify-Connect on Shannon).
+/// Future per-zone routing extends the entity table on the daemon side
+/// without touching the kiosk.
+const MUSIC_DEFAULT_ENTITY: &str = "default";
+
+/// Fire-and-forget POST to the daemon's `/media/{entity_key}/{action}`
+/// endpoint. Mirrors `spawn_daemon_lights_post`'s shape — short-lived
+/// std::thread + reqwest::blocking with a 5s timeout, panic-proof on
+/// thread-spawn failure. The daemon translates `entity_key`+`action`
+/// into an HA `media_player.*` service call via `plan_media`.
+fn spawn_daemon_media_post(daemon_url: String, entity_key: String, action: String) {
+    let result = std::thread::Builder::new()
+        .name(format!("daemon-post-media-{entity_key}-{action}"))
+        .spawn(move || {
+            let url = format!(
+                "{}/media/{}/{}",
+                daemon_url.trim_end_matches('/'),
+                entity_key,
+                action
+            );
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("daemon-post-media: client build failed: {e}");
+                    return;
+                }
+            };
+            match client.post(&url).send() {
+                Ok(resp) => info!("daemon POST {} → {}", url, resp.status()),
+                Err(e) => warn!("daemon POST {} failed: {}", url, e),
+            }
+        });
+    if let Err(e) = result {
+        warn!("daemon-post-media: thread spawn failed (resource limit?): {e}");
+    }
+}
+
+/// Debounced dispatch helper for Music. Returns true if the request
+/// was sent, false if throttled (within `MUSIC_DEBOUNCE_MS` of the
+/// previous dispatch). Wraps `spawn_daemon_media_post` so the
+/// match-arm call site stays one line. Separate debounce field
+/// (`last_media_action_at`) from lights/watch — see field doc.
+fn try_dispatch_media(
+    engine_res: &mut EngineRes,
+    daemon_url: &DaemonUrl,
+    entity_key: &str,
+    action: &str,
+) -> bool {
+    let now = std::time::Instant::now();
+    if let Some(last) = engine_res.last_media_action_at {
+        if now.duration_since(last) < Duration::from_millis(MUSIC_DEBOUNCE_MS) {
+            info!("media {} {} throttled (rapid press)", entity_key, action);
+            return false;
+        }
+    }
+    engine_res.last_media_action_at = Some(now);
+    spawn_daemon_media_post(
+        daemon_url.0.clone(),
+        entity_key.to_string(),
+        action.to_string(),
+    );
     true
 }
 
@@ -1221,16 +1305,43 @@ fn gamepad_event_system(
                             info!("Watch: dispatching {:?}", WATCH_SMOKE_TITLE);
                             try_dispatch_watch(&mut engine_res, &daemon_url, WATCH_SMOKE_TITLE);
                         }
-                        // Other tiles (Games, Music, Sensors): South-
-                        // arm wiring pending per the kiosk plan's
-                        // tile-action roadmap. Games = RetroArch
-                        // launch (needs cage process-model research);
-                        // Music = HA media_player.fredrik (the
-                        // spotifyd Spotify-Connect entity on Shannon)
-                        // via a new daemon `/media/<entity>/<action>`
-                        // endpoint (Session A's territory when wired);
-                        // Sensors = preview-pane redesign (render-
-                        // system, not an action).
+                        MenuItem::Music => {
+                            // A on MUSIC = toggle play/pause on the
+                            // default media_player entity (today:
+                            // `media_player.fredrik` = spotifyd
+                            // Spotify-Connect on Shannon, advertised
+                            // via mDNS). Daemon's /media route does
+                            // `homeassistant.media_player.media_play_pause`
+                            // on whatever entity `MUSIC_DEFAULT_ENTITY`
+                            // resolves to in `HaConfig::media_entities`.
+                            //
+                            // Toggle semantics are the right default:
+                            // it works whether music is currently
+                            // playing or not, and the user mental model
+                            // is "press to start/stop" — no need for
+                            // separate play/pause tiles.
+                            //
+                            // Future per-zone routing (vardagsrum /
+                            // atelier / etc.) extends
+                            // `HaConfig::media_entities` on the daemon
+                            // + adds a sub-menu here (similar to the
+                            // Lights submenu pattern). For first wire,
+                            // single-entity default is enough.
+                            info!("Music: toggle play/pause ({})", MUSIC_DEFAULT_ENTITY);
+                            try_dispatch_media(
+                                &mut engine_res,
+                                &daemon_url,
+                                MUSIC_DEFAULT_ENTITY,
+                                "play_pause",
+                            );
+                        }
+                        // Other tiles (Games, Sensors): South-arm
+                        // wiring pending per the kiosk plan's tile-
+                        // action roadmap. Games = RetroArch launch
+                        // (needs cage process-model research, mode-
+                        // script + daemon /mode/{m} route; design hub
+                        // §13.29); Sensors = preview-pane redesign
+                        // (render-system, not an action).
                         _ => {}
                     }
                 }

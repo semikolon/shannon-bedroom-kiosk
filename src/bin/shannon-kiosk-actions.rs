@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 use shannon_kiosk::context::{
     Action, ClockMinutes, Config, DisplayState, Engine, Inputs, Manual, Media,
 };
-use shannon_kiosk::ha::{apply_engine_action, plan_lights, HaCall, HaConfig};
+use shannon_kiosk::ha::{apply_engine_action, plan_lights, plan_media, HaCall, HaConfig};
 use shannon_kiosk::ha_poll::{
     binary_sensor_from_str, BinarySensorState, HaPollState, MediaPlayerState, PollResult,
 };
@@ -91,6 +91,7 @@ async fn main() {
         .route("/ha-state", get(ha_state_handler))
         .route("/signal", post(signal_handler))
         .route("/lights/:group/:action", post(lights_handler))
+        .route("/media/:entity_key/:action", post(media_handler))
         .route("/watch", post(watch_handler))
         .with_state(state);
 
@@ -354,6 +355,33 @@ async fn lights_handler(
     Path((group, action)): Path<(String, String)>,
 ) -> impl IntoResponse {
     match plan_lights(&group, &action, &s.ha) {
+        Ok(call) => {
+            let status = send(&s.http, &s.ha, &call).await;
+            (
+                StatusCode::OK,
+                Json(json!({ "call": describe_call(&call), "result": status })),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Music tile + future-zone routing. `POST /media/{entity_key}/{action}`
+/// maps `entity_key` (e.g., `"default"`, `"fredrik"`) to a configured
+/// `media_player.*` entity and `action` to an HA `media_player.*`
+/// service (`play_pause` / `play` / `pause` / `stop` / `next` / `prev`).
+///
+/// Mirrors `lights_handler` shape — sync HA call, returns 200 with the
+/// rendered HaCall + HA HTTP status, 400 on unknown entity/action.
+/// Body is empty (entity + action are path params, no payload needed).
+async fn media_handler(
+    State(s): State<Arc<AppState>>,
+    Path((entity_key, action)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match plan_media(&entity_key, &action, &s.ha) {
         Ok(call) => {
             let status = send(&s.http, &s.ha, &call).await;
             (

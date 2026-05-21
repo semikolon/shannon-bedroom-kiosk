@@ -26,6 +26,7 @@ pub struct HaCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HaError {
     UnknownLightGroup(String),
+    UnknownMediaEntity(String),
     UnknownAction(String),
 }
 
@@ -33,6 +34,7 @@ impl std::fmt::Display for HaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HaError::UnknownLightGroup(g) => write!(f, "unknown light group: {g}"),
+            HaError::UnknownMediaEntity(e) => write!(f, "unknown media entity: {e}"),
             HaError::UnknownAction(a) => write!(f, "unknown action: {a}"),
         }
     }
@@ -65,6 +67,13 @@ pub struct HaConfig {
     /// composite action accidentally grabbing them. See also
     /// `docs/personal_iot.md` § "Auxiliary (NOT a lamp)".
     pub light_groups: Vec<(String, String)>,
+    /// Friendly kiosk media-entity name → HA `media_player.*` entity.
+    /// `"default"` is the Music tile's target (toggle play/pause); today
+    /// that's `media_player.fredrik` (spotifyd Spotify-Connect on
+    /// Shannon, advertised via mDNS). Future per-zone routing extends
+    /// the table (vardagsrum / atelier / etc.) without changing the
+    /// resolver shape.
+    pub media_entities: Vec<(String, String)>,
 }
 
 impl Default for HaConfig {
@@ -78,6 +87,10 @@ impl Default for HaConfig {
                 ("office".to_string(), "group.office_lights".to_string()),
                 ("hallway".to_string(), "group.hallway_indicator".to_string()),
             ],
+            media_entities: vec![
+                ("default".to_string(), "media_player.fredrik".to_string()),
+                ("fredrik".to_string(), "media_player.fredrik".to_string()),
+            ],
         }
     }
 }
@@ -87,6 +100,13 @@ impl HaConfig {
         self.light_groups
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(group))
+            .map(|(_, entity)| entity.as_str())
+    }
+
+    fn resolve_media_entity(&self, key: &str) -> Option<&str> {
+        self.media_entities
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
             .map(|(_, entity)| entity.as_str())
     }
 }
@@ -108,6 +128,34 @@ pub fn plan_tv_power(on: bool, cfg: &HaConfig) -> HaCall {
         service: service_for_onoff(on).to_string(),
         entity_id: cfg.tv_plug_entity.clone(),
     }
+}
+
+/// Plan a media_player action from a kiosk request. `entity_key` is a
+/// friendly kiosk-side name (e.g., `"fredrik"` or `"default"`) that
+/// resolves to a configured `media_player.*` entity in HA. `action` maps
+/// to HA's `media_player.*` services (`play_pause` / `play` / `pause` /
+/// `stop` / `next` / `prev`, case-insensitive). The Music tile uses
+/// `"default" + "play_pause"` to toggle the spotifyd Spotify-Connect
+/// entity (`media_player.fredrik`); future per-zone routing extends
+/// `resolve_media_entity` to map additional keys.
+pub fn plan_media(entity_key: &str, action: &str, cfg: &HaConfig) -> Result<HaCall, HaError> {
+    let entity = cfg
+        .resolve_media_entity(entity_key)
+        .ok_or_else(|| HaError::UnknownMediaEntity(entity_key.to_string()))?;
+    let service = match action.to_ascii_lowercase().as_str() {
+        "play_pause" | "toggle" => "media_play_pause",
+        "play" => "media_play",
+        "pause" => "media_pause",
+        "stop" => "media_stop",
+        "next" | "next_track" => "media_next_track",
+        "prev" | "previous" | "previous_track" => "media_previous_track",
+        other => return Err(HaError::UnknownAction(other.to_string())),
+    };
+    Ok(HaCall {
+        domain: "media_player".to_string(),
+        service: service.to_string(),
+        entity_id: entity.to_string(),
+    })
 }
 
 /// Plan a lights group call from a kiosk request. `action` is `"on"`,
@@ -232,6 +280,56 @@ mod tests {
         assert_eq!(
             HaError::UnknownLightGroup("x".into()).to_string(),
             "unknown light group: x"
+        );
+        assert_eq!(
+            HaError::UnknownMediaEntity("y".into()).to_string(),
+            "unknown media entity: y"
+        );
+    }
+
+    #[test]
+    fn media_play_pause_maps_to_default_entity() {
+        let c = HaConfig::default();
+        let call = plan_media("default", "play_pause", &c).expect("default key resolves");
+        assert_eq!(call.domain, "media_player");
+        assert_eq!(call.service, "media_play_pause");
+        assert_eq!(call.entity_id, "media_player.fredrik");
+        // Aliases
+        assert_eq!(
+            plan_media("Fredrik", "toggle", &c).unwrap().service,
+            "media_play_pause"
+        );
+    }
+
+    #[test]
+    fn media_actions_map_correctly() {
+        let c = HaConfig::default();
+        for (action, service) in [
+            ("play", "media_play"),
+            ("pause", "media_pause"),
+            ("stop", "media_stop"),
+            ("next", "media_next_track"),
+            ("next_track", "media_next_track"),
+            ("prev", "media_previous_track"),
+            ("previous", "media_previous_track"),
+            ("previous_track", "media_previous_track"),
+        ] {
+            let call = plan_media("default", action, &c)
+                .unwrap_or_else(|_| panic!("action {action:?} should map"));
+            assert_eq!(call.service, service, "action {action:?}");
+        }
+    }
+
+    #[test]
+    fn media_rejects_unknown_entity_and_action() {
+        let c = HaConfig::default();
+        assert_eq!(
+            plan_media("vardagsrum", "play", &c),
+            Err(HaError::UnknownMediaEntity("vardagsrum".into()))
+        );
+        assert_eq!(
+            plan_media("default", "rewind", &c),
+            Err(HaError::UnknownAction("rewind".into()))
         );
     }
 }
