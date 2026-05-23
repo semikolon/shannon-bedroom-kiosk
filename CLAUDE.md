@@ -4,7 +4,9 @@ Bevy 0.18 retro UI for Shannon's bedroom HDMI display. Xbox-controller-driven me
 
 **Canonical plan**: `~/dotfiles/docs/shannon_bedroom_kiosk_plan_2026_05_06.md` — vision, phased roadmap, risk register, implementation log. Latest authoritative phase-detail hub: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` (Phase 3 design + § 13 changelog of every Phase-3 wiring).
 
-**Phase status (2026-05-23)**: Phase 3 LIVE on Shannon (4 of 6 tiles wired with real actions: Lights, Music, Watch, Sleep). Phase-7 spela-on-Shannon keystone shipped — Watch tile dispatches to Shannon's local spela-thin-client + ALSO integrated as a "Shannon TV" target in spela's web remote.
+**Phase status (2026-05-24)**: Phase 3 LIVE on Shannon (4 of 6 tiles wired with real actions: Lights, Music, Watch, Sleep). Phase-7 spela-on-Shannon keystone shipped — Watch tile dispatches to Shannon's local spela-thin-client + ALSO integrated as a "Shannon TV" target in spela's web remote.
+
+**Boot path (2026-05-24 update)**: Plymouth graphical splash + seamless splash→kiosk handoff LIVE — `bootlogo=true` + `console=serial` + initramfs DRM modules deploy via the dotfiles `shannon-boot-splash-apply` script (commit `98b6ace5`); `shannon-display.service` now declares `Conflicts=getty@tty1` + `After=plymouth-quit-wait.service` + `ExecStartPre=-/usr/bin/plymouth quit --retain-splash` for clean DRM-master handoff (no terminal flash between layers). Full architecture in `~/dotfiles/system/shannon/README.md` § "Plymouth boot splash + kiosk handoff architecture" (the three load-bearing flags, the SD-vs-Demeter `/boot` sync split, the verification pattern). Visual verification by Fredrik on next watched reboot pending; technical render path confirmed via `plymouthd --debug` (scanout buffer set on 1920x1080 head). The `fb0-capture` tool is busted for visual probing — modern DRM/KMS bypasses `/dev/fb0` (both cage and plymouthd take DRM master directly), captures land as pure white; kmsgrab replacement tracked in dotfiles `TODO.md`.
 
 ## Architecture
 
