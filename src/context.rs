@@ -220,10 +220,7 @@ pub struct StepOutcome {
     pub actions: Vec<Action>,
 }
 
-/// A menu tile in the Kiosk-state retro menu (Slice 3 visual layer).
-/// The canonical six per design § 13.1: Sleep replaces the original
-/// design-doc Settings (Sleep paired with engine `ForceOff` is more
-/// useful at the moment of interaction than a meta-config tile).
+/// A menu tile in the Kiosk-state menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MenuItem {
     Games,
@@ -231,6 +228,7 @@ pub enum MenuItem {
     Lights,
     Watch,
     Sensors,
+    Buses,
     Sleep,
 }
 
