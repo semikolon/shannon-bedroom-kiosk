@@ -1,16 +1,43 @@
 # shannon-bedroom-kiosk
 
-Bevy 0.14 retro UI for Shannon's bedroom HDMI display. Xbox-controller-driven menu launching games / lights / streaming services / sensors.
+Bevy 0.18 retro UI for Shannon's bedroom HDMI display. Xbox-controller-driven menu surfacing lights / music / Shannon-as-spela-target / sensors / bus departures.
 
-**Canonical plan**: `~/dotfiles/docs/shannon_bedroom_kiosk_plan_2026_05_06.md` — vision, phased roadmap, risk register, implementation log. Read this first.
+**Canonical plan**: `~/dotfiles/docs/shannon_bedroom_kiosk_plan_2026_05_06.md` — vision, phased roadmap, risk register, implementation log. Latest authoritative phase-detail hub: `~/dotfiles/docs/shannon_kiosk_phase3a_display_power_engine_design_2026_05_19.md` (Phase 3 design + § 13 changelog of every Phase-3 wiring).
 
-**Phase status (2026-05-06 evening)**: Phase 1 done end-to-end (cross-compile + display + Bevy + Xbox controller). Phase 2 (retro UI shell — pixel font, CRT shader, menu navigation) is the active workstream.
+**Phase status (2026-05-23)**: Phase 3 LIVE on Shannon (4 of 6 tiles wired with real actions: Lights, Music, Watch, Sleep). Phase-7 spela-on-Shannon keystone shipped — Watch tile dispatches to Shannon's local spela-thin-client + ALSO integrated as a "Shannon TV" target in spela's web remote.
 
 ## Architecture
 
-`main.rs` runs Bevy with reactive `WinitSettings::desktop_app()` mode + bevy_gilrs gamepad input. Cross-compiled to aarch64 via cross-rs `:edge` (Cross.toml lists arm64 dev libs). Deployed as `/usr/local/bin/shannon-kiosk` on Shannon, launched under `cage` (Wayland compositor, no Xwayland needed) via `shannon-display.service` MODE=`shannon-kiosk` (mode script at `dotfiles/system/shannon/etc/shannon-modes/shannon-kiosk.sh`).
+`main.rs` runs Bevy 0.18 with `WinitSettings::Reactive { wait: 10ms }` + bevy_gilrs gamepad input. Cross-compiled to aarch64 via cross-rs `:edge` on Darwin (NOT on Shannon — heavy native builds wedged Shannon in May 2026). Deployed as `/usr/local/bin/shannon-kiosk`, launched under `cage` (Wayland compositor + rootless Xwayland) via `shannon-display.service` MODE=`shannon-kiosk` (mode script at `dotfiles/system/shannon/etc/shannon-modes/shannon-kiosk.sh`).
 
-Action handlers (Phase 3+) will be a separate Rust+axum daemon at `127.0.0.1:8080` — NOT in this binary. Bevy posts to it for game launches / light toggles / Chromium spawns.
+Action daemon is a separate binary `shannon-kiosk-actions` bound to `0.0.0.0:8080` since 2026-05-23 (LAN-accessible so Darwin spela can dispatch Watch sessions; was `127.0.0.1:8080` previously). Bevy POSTs to it for HA actions; spela POSTs to it for `target=shannon`. Override via env `SHANNON_KIOSK_ACTIONS_BIND` to tighten.
+
+## Tile state (the menu surface)
+
+Six tiles + two submenus. The South-arm (A) match in `gamepad_event_system`:
+
+| Tile | A-button action | State |
+|------|----------------|-------|
+| **Lights** | Opens `LightsSubmenu` (bedroom/office/hallway). A on group → daemon `/lights/<group>/toggle` → HA toggle. X-button = global toggle bedroom+office (`X_ALL_TOGGLE_GROUPS`). | ✅ LIVE |
+| **Music** | Opens `MusicSubmenu` (play_pause / previous / next). A on action → daemon `/media/default/<action>` → HA `media_player.fredrik` (spotifyd). No-op when Spotify Connect is idle. | ✅ LIVE; needs Spotify active |
+| **Watch** | `try_dispatch_watch(WATCH_SMOKE_TITLE)` → daemon `/watch` → spawns `spela-local` → HLS pipeline. **Currently hardcodes one smoke title** — Fredrik's direction is to mirror spela's web remote UI (search + library grid + now-playing + scrubber) natively. Native Bevy implementation is the active workstream. | 🟡 keystone wired, UI scaffolding pending |
+| **Sleep** | Engine ForceOff (TV blackout via BlackoutTvPower) + `try_dispatch_lights_multi(X_ALL_TOGGLE_GROUPS, "off")`. Hallway stays presence-driven (not in the set). | ✅ LIVE |
+| **Sensors** | Half opacity (passive). Preview pane mirrors Sarpetorp dashboard's WoodStoveWidget when cursor is on Sensors (indoor temp + evening prediction + sparkline). Polls `http://sarpetorp.home/data/*` on a background tokio task. | ✅ polling shipped; live-verification on TV pending |
+| **Buses** | Full opacity (real data). Preview pane mirrors BusWidget — northbound (Björkvik) + southbound (Nyköping) departures with "leave now" urgency. Same polling backend. | ✅ polling shipped; live-verification on TV pending |
+| **Games** | Half opacity (not-ready). Deferred — needs cage process-model design (single-client compositor + RetroArch swap) per design hub § 13.29. | ⏸ deferred |
+
+**Idle/sleep state — CRITICAL for future agents** (Codex misdiagnosed this 2026-05-22 and burned hours on phantom Bevy windowing bugs): when the kiosk is in its Off/blackout DisplayState, the screen shows the cage clear color, sometimes with just the Xwayland cursor visible. **This is intentional** — controller input wakes it. Don't tear down render pipelines chasing a "black screen" that's actually idle. If `menu_render: level=Root cursor=...` shows in logs, Bevy IS drawing; the kiosk is just in sleep. Fresh controller input (any D-pad / button) wakes via `gamepad_event_system::fresh_controller_input`. Cross-ref: 2026-05-22 Codex session in the design hub § 13.x.
+
+## Phase-7 spela-thin-client (Watch tile + Shannon TV web target)
+
+Watch tile → daemon POST `/watch {"title": ...}` → spawns `spela-local <title>` (shell at `~/dotfiles/system/shannon/usr/local/bin/spela-local`) → spela-local does `/search` + `/play target=vlc` against Darwin spela → fetches HLS + decodes locally. Two-path renderer in spela-local (2026-05-23):
+
+- **Path A (HW)**: `fdsrc + tsdemux + h264parse + v4l2slh264dec + videoconvert + kmssink`. Engages `rkvdec` at `/dev/video2` for stateless H.264 decode. Verified at file level 2026-05-21 (~25% CPU spread + V4L2-request allocator activity); REGRESSED 2026-05-23 — same pipeline EOSes in <1s with zero allocator activity, cause unknown. First probe: Shannon reboot to reset rkvdec state.
+- **Path B (SW fallback)**: `playbin3 + kmssink + autoaudiosink`. Plays reliably with audio but SW-decodes (97% one core on 1.008 GHz cap, visible stutter on busy scenes).
+
+`spela-local` tries A first with an 8s preroll budget; if A dies fast it falls back to B. Full HW-decode reasoning + GStreamer rank-syntax gotchas + MODE-drift lesson: `~/dotfiles/docs/shannon_kiosk_gpu_hwaccel_research_2026_05_18.md` § 6.
+
+**Spela web remote integration**: target picker now shows "Shannon TV" alongside "This phone" and Chromecasts. `spela /play target=shannon` POSTs to `http://192.168.4.30:8080/watch` (override via `shannon_watch_url` in spela config). Shannon's spela-local does its own /search + /play loop. **Known edge** (open loop): target=shannon currently passes ONLY the title, not the user's `result_id` choice — Shannon's own /search might pick a different torrent than the one the user clicked Watch on. Fix: thread result_id through /watch body + have spela-local accept `--result-id N`.
 
 ## Build & Deploy
 

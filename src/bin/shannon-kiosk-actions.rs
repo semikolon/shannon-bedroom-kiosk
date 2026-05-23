@@ -95,9 +95,17 @@ async fn main() {
         .route("/watch", post(watch_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
+    // Bind: default to LAN-accessible 0.0.0.0:8080 so Darwin spela can
+    // POST /watch when target=shannon is picked in the web remote. The
+    // /watch handler's title validation (length ≤200, no control chars)
+    // + Command::arg-not-shell-exec are the security posture. Tighten
+    // via env SHANNON_KIOSK_ACTIONS_BIND if needed (e.g. to
+    // "192.168.4.30:8080" — Shannon's LAN-reserved IP — or back to
+    // "127.0.0.1:8080" if LAN access is undesirable).
+    let bind_addr = env_or("SHANNON_KIOSK_ACTIONS_BIND", "0.0.0.0:8080");
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
-        .expect("bind 127.0.0.1:8080");
+        .unwrap_or_else(|e| panic!("bind {}: {}", bind_addr, e));
     axum::serve(listener, app).await.expect("serve");
 }
 
