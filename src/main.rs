@@ -326,6 +326,17 @@ struct EngineRes {
     /// has its own response latency); rapid A-presses on the Music tile
     /// would race the play↔pause flip. `MUSIC_DEBOUNCE_MS` matches.
     last_media_action_at: Option<std::time::Instant>,
+    /// Slice 1.5 (2026-05-24 evening user TV-test fix): the title of
+    /// the last successfully-dispatched Watch entry + when it was
+    /// dispatched. Drives `pending_watch_overlay_system`, which paints
+    /// "STARTING <title>..." over the kiosk so the user has IMMEDIATE
+    /// visual feedback during Darwin's 20-60 s NVENC cold-start. Without
+    /// this, the user re-presses A thinking the first press missed,
+    /// spawning parallel spela-local sessions racing for /play (the
+    /// 2026-05-24 evening Ex.Machina incident — paired with the
+    /// `WATCH_DEBOUNCE_MS = 30 s` bump for defense-in-depth). Cleared
+    /// after `WATCH_OVERLAY_TIMEOUT_MS` so a stale overlay never sticks.
+    pending_watch: Option<(String, std::time::Instant)>,
 }
 
 /// One snapshot of HA state from the daemon's /ha-state endpoint.
@@ -425,6 +436,7 @@ impl Default for EngineRes {
             last_lights_action_at: None,
             last_watch_action_at: None,
             last_media_action_at: None,
+            pending_watch: None,
         }
     }
 }
@@ -466,6 +478,13 @@ struct LightsSubmenuIcon {
 struct LightsSubmenuLabel {
     index: usize,
 }
+
+/// Slice 1.5 marker — the "STARTING <title>..." overlay text painted
+/// over the kiosk on Watch dispatch. Single entity, spawned hidden in
+/// setup_ui, shown/hidden + text-updated by pending_watch_overlay_system
+/// based on EngineRes.pending_watch.
+#[derive(Component)]
+struct WatchPendingOverlay;
 
 #[derive(Component)]
 struct StateBadge;
@@ -664,6 +683,7 @@ fn main() {
                 ambient_render_system,
                 blackout_render_system,
                 state_badge_system,
+                pending_watch_overlay_system,
             ),
         )
         .run();
@@ -821,6 +841,14 @@ const X_ALL_TOGGLE_GROUPS: &[&str] = &["bedroom", "office"];
 // pending_watch overlay so user sees "STARTING <title>..." immediately
 // and trusts the first press.
 const WATCH_DEBOUNCE_MS: u64 = 30000;
+
+/// How long the "STARTING <title>..." overlay stays visible after a
+/// Watch dispatch. Sized to cover Darwin's worst-case NVENC cold-start
+/// (~60 s) plus a safety margin so the overlay never goes away BEFORE
+/// the video appears. A future enhancement could clear this earlier on
+/// a "cage stopped" signal from spela-local but the timeout is the
+/// belt-and-suspenders baseline.
+const WATCH_OVERLAY_TIMEOUT_MS: u64 = 90000;
 
 /// Default smoke-test title for the Watch tile (Phase-7 Layer-4b v1).
 /// Fredrik's canonical spela search example — used throughout spela
@@ -1393,6 +1421,45 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         },
         StateBadge,
     ));
+
+    // ─── Slice 1.5: Watch-dispatch "STARTING <title>..." overlay ──────
+    // Spawned hidden; pending_watch_overlay_system flips visibility +
+    // updates text from EngineRes.pending_watch. Positioned at the
+    // vertical+horizontal center of the 1920×1080 kiosk canvas, with
+    // a translucent dark backing card so it reads against any scene.
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(440.0),
+            left: Val::Px(360.0),
+            width: Val::Px(1200.0),
+            height: Val::Px(200.0),
+            padding: UiRect::all(Val::Px(40.0)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.02, 0.04, 0.02, 0.85)),
+        BorderColor::all(Color::srgba(0.65, 0.92, 0.55, 0.50)),
+        Visibility::Hidden,
+        WatchPendingOverlay,
+    ));
+    commands.spawn((
+        Text::new("STARTING…"),
+        TextFont {
+            font: fonts.bold.clone(),
+            font_size: 56.0,
+            ..default()
+        },
+        TextColor(OAT_MILK),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(490.0),
+            left: Val::Px(400.0),
+            width: Val::Px(1120.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        WatchPendingOverlay,
+    ));
 }
 
 // ─── Systems ─────────────────────────────────────────────────────────
@@ -1560,6 +1627,15 @@ fn gamepad_event_system(
                         }
                     };
                     info!("Watch (submenu): dispatching {:?}", title);
+                    // Slice 1.5: set pending_watch BEFORE the dispatch
+                    // call so the overlay shows IMMEDIATELY even if the
+                    // POST hangs on the daemon. If try_dispatch_watch is
+                    // throttled (debounce window not yet expired), we
+                    // still show the overlay because the user pressed A
+                    // and deserves feedback (the previous press's overlay
+                    // would already be visible anyway from its own set).
+                    engine_res.pending_watch =
+                        Some((title.clone(), std::time::Instant::now()));
                     try_dispatch_watch(&mut engine_res, &daemon_url, &title);
                 }
             },
@@ -2587,6 +2663,7 @@ fn menu_render_system(
             &mut Text,
             &mut TextColor,
             &mut Visibility,
+            &mut Node,
             &LightsSubmenuLabel,
         ),
         (
@@ -2600,6 +2677,7 @@ fn menu_render_system(
             &mut Text,
             &mut TextColor,
             &mut Visibility,
+            &mut Node,
             &LightsSubmenuIcon,
         ),
         (
@@ -2682,22 +2760,30 @@ fn menu_render_system(
         *prev_selected = Some(selected);
     }
 
-    // Root menu: visible iff at Root level. Selection highlights cursor.
+    // Root menu: visible at Root level OR during WatchSubmenu (Slice
+    // 1.5 keep-sidebar-visible fix; user expected sidebar to stay when
+    // browsing the library list to the right). LightsSubmenu/MusicSubmenu
+    // keep the old hide-root behavior because those submenus reuse the
+    // sidebar's x positions. `root_selected_idx` follows the engine
+    // cursor (MenuItem::Watch when in WatchSubmenu) so the sidebar's
+    // Watch row stays highlighted while the library browses.
+    let root_selected_idx = menu_index_of(engine_res.cursor);
+    let show_root = !in_submenu || is_watch;
     for (mut color, mut vis, label) in root_label_q.iter_mut() {
-        *vis = if in_submenu {
-            Visibility::Hidden
-        } else {
+        *vis = if show_root {
             Visibility::Inherited
+        } else {
+            Visibility::Hidden
         };
-        color.0 = menu_color(label.index, label.index == selected && !in_submenu);
+        color.0 = menu_color(label.index, label.index == root_selected_idx && show_root);
     }
     for (mut color, mut vis, icon) in root_icon_q.iter_mut() {
-        *vis = if in_submenu {
-            Visibility::Hidden
-        } else {
+        *vis = if show_root {
             Visibility::Inherited
+        } else {
+            Visibility::Hidden
         };
-        color.0 = menu_color(icon.index, icon.index == selected && !in_submenu);
+        color.0 = menu_color(icon.index, icon.index == root_selected_idx && show_root);
     }
     for (mut vis, _marker) in cursor_q.iter_mut() {
         // Cursor markers removed by design (Fredrik 2026-05-21) — no
@@ -2709,7 +2795,17 @@ fn menu_render_system(
     // Tile submenus: inverse of the root menu. WatchSubmenu uses
     // `watch_slots` (windowed library) instead of `static_submenu`; static
     // path drives LightsSubmenu / MusicSubmenu.
-    for (mut text, mut color, mut vis, sub) in sub_label_q.iter_mut() {
+    //
+    // Slice 1.5 layout fix: when is_watch, move sub entities to the
+    // right of the sidebar (x=560/620) so the library list reads as
+    // a column distinct from the sidebar. Lights/Music submenus keep
+    // their original x=130/200 so they continue to read as "submenu
+    // replacing the sidebar in-place" (they only have 3 short entries
+    // each — the layout works there).
+    let sub_label_left = if is_watch { 620.0 } else { 200.0 };
+    let sub_icon_left = if is_watch { 560.0 } else { 130.0 };
+    for (mut text, mut color, mut vis, mut node, sub) in sub_label_q.iter_mut() {
+        node.left = Val::Px(sub_label_left);
         if is_watch {
             // Watch path: render from windowed library snapshot.
             let slot = watch_slots.get(sub.index);
@@ -2746,7 +2842,8 @@ fn menu_render_system(
             };
         }
     }
-    for (mut text, mut color, mut vis, sub) in sub_icon_q.iter_mut() {
+    for (mut text, mut color, mut vis, mut node, sub) in sub_icon_q.iter_mut() {
+        node.left = Val::Px(sub_icon_left);
         if is_watch {
             // Watch path: ICON_WATCH for every visible library slot.
             let slot = watch_slots.get(sub.index);
@@ -2783,12 +2880,77 @@ fn menu_render_system(
     }
 }
 
-fn preview_render_system(engine_res: Res<EngineRes>, mut q: Query<(&mut Text, &PreviewElement)>) {
+/// Slice 1.5 — paint the "STARTING <title>..." overlay over the kiosk
+/// for `WATCH_OVERLAY_TIMEOUT_MS` after a Watch dispatch. Driven by
+/// `EngineRes.pending_watch`. The two WatchPendingOverlay entities are
+/// (1) a translucent backing card (no Text) and (2) a label Text — both
+/// visibility-flipped together; only the Text entity gets the title
+/// content updated.
+#[allow(clippy::type_complexity)]
+fn pending_watch_overlay_system(
+    mut engine_res: ResMut<EngineRes>,
+    mut q: Query<(&mut Visibility, Option<&mut Text>), With<WatchPendingOverlay>>,
+) {
+    let now = std::time::Instant::now();
+    let (visible, label) = match engine_res.pending_watch.as_ref() {
+        Some((title, t)) => {
+            if now.duration_since(*t).as_millis()
+                > WATCH_OVERLAY_TIMEOUT_MS as u128
+            {
+                (false, None)
+            } else {
+                // Truncate over-long release titles for the overlay so
+                // they don't overflow the 1120 px label width. The full
+                // title still went to spela-local via try_dispatch_watch.
+                let trimmed = if title.len() > 56 {
+                    format!("{}…", &title[..55])
+                } else {
+                    title.clone()
+                };
+                (true, Some(format!("STARTING {}…", trimmed)))
+            }
+        }
+        None => (false, None),
+    };
+
+    for (mut vis, text) in q.iter_mut() {
+        *vis = if visible {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if let (Some(mut t), Some(lbl)) = (text, label.as_ref()) {
+            if t.0 != *lbl {
+                t.0 = lbl.clone();
+            }
+        }
+    }
+
+    // Once we've decided not-visible, clear the field so we don't
+    // re-evaluate the timeout every tick forever.
+    if !visible && engine_res.pending_watch.is_some() {
+        engine_res.pending_watch = None;
+    }
+}
+
+fn preview_render_system(
+    engine_res: Res<EngineRes>,
+    mut q: Query<(&mut Text, &mut Visibility, &PreviewElement)>,
+) {
     if !engine_res.is_changed() {
         return;
     }
+    // Slice 1.5: hide preview pane content while WatchSubmenu is
+    // active. The library list now lives at x=560/620 (where the
+    // preview icon/label used to be) and would overlap unreadably.
+    let hide_for_watch = matches!(engine_res.menu_level, MenuLevel::WatchSubmenu);
     let (icon, label, subtitle) = preview_for(engine_res.cursor);
-    for (mut text, element) in q.iter_mut() {
+    for (mut text, mut vis, element) in q.iter_mut() {
+        *vis = if hide_for_watch {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
         let new_value = match element {
             PreviewElement::Icon => icon.to_string(),
             PreviewElement::Label => label.to_string(),
