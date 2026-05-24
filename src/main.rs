@@ -64,6 +64,8 @@ const OAT_DIM: Color = Color::srgb(0.55, 0.56, 0.49); // secondary text
 const OAT_FAINT: Color = Color::srgb(0.38, 0.39, 0.36); // tertiary text
 const AMBER_ACCENT: Color = Color::srgb(0.94, 0.71, 0.18); // selected + [A]
 
+mod watch_ui;
+
 // ─── Embedded font assets (commit-time bundled into the binary) ──────
 const SHARP_SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/SharpSans-Semibold.otf");
 const SHARP_SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/SharpSans-Bold.otf");
@@ -191,6 +193,11 @@ enum MenuLevel {
     Root,
     LightsSubmenu,
     MusicSubmenu,
+    /// Watch tile submenu (Phase-7 rank-1, 2026-05-24): browse spela's
+    /// library; A on entry dispatches it via try_dispatch_watch. Content
+    /// is DYNAMIC (from `watch_ui::LibrarySnapshotRes`) so submenu_for
+    /// returns &[] — render path special-cases this variant.
+    WatchSubmenu,
 }
 
 struct SubmenuTile {
@@ -243,6 +250,10 @@ fn submenu_for(level: MenuLevel) -> &'static [SubmenuTile] {
         MenuLevel::Root => &[],
         MenuLevel::LightsSubmenu => LIGHTS_SUBMENU,
         MenuLevel::MusicSubmenu => MUSIC_SUBMENU,
+        // WatchSubmenu has DYNAMIC content from watch_ui::LibrarySnapshotRes.
+        // menu_render_system + gamepad_event_system special-case this variant
+        // to read the library snapshot instead of this static slice.
+        MenuLevel::WatchSubmenu => &[],
     }
 }
 
@@ -589,6 +600,21 @@ fn main() {
                 base_url,
                 Duration::from_secs(interval_secs),
             ))
+        })
+        .insert_resource({
+            // Watch UI library poller (Phase-7 rank-1, 2026-05-24): polls
+            // spela's /library endpoint so the WatchSubmenu can browse the
+            // user's media library natively in Bevy (replaces the hardcoded
+            // WATCH_SMOKE_TITLE). Spela base URL is configurable via env;
+            // default mirrors the same darwin.home reachable from Shannon
+            // that the daemon's /watch handler uses.
+            let base_url = std::env::var("SPELA_BASE_URL")
+                .unwrap_or_else(|_| "http://darwin.home:7890".to_string());
+            let interval_secs = std::env::var("SPELA_LIBRARY_POLL_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(120);
+            watch_ui::spawn_library_poller(base_url, Duration::from_secs(interval_secs))
         })
         .add_plugins(
             DefaultPlugins
@@ -1076,7 +1102,13 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
 
     // ─── Tile submenus at the first menu y positions. Hidden by default;
     // menu_render_system swaps labels/icons from the active submenu.
-    let submenu_slots = LIGHTS_SUBMENU.len().max(MUSIC_SUBMENU.len());
+    // Slot count must accommodate the LARGEST submenu. WatchSubmenu wants
+    // WATCH_VISIBLE_SLOTS (10) for a windowed library list; LightsSubmenu /
+    // MusicSubmenu only fill 3 (rest stay Visibility::Hidden via menu_render).
+    let submenu_slots = LIGHTS_SUBMENU
+        .len()
+        .max(MUSIC_SUBMENU.len())
+        .max(watch_ui::WATCH_VISIBLE_SLOTS);
     for i in 0..submenu_slots {
         let sub = LIGHTS_SUBMENU.get(i).unwrap_or(&LIGHTS_SUBMENU[0]);
         let y = 240.0 + (i as f32 * 88.0);
@@ -1363,12 +1395,23 @@ fn gamepad_event_system(
     mut axis_events: MessageReader<GamepadAxisChangedEvent>,
     mut engine_res: ResMut<EngineRes>,
     daemon_url: Res<DaemonUrl>,
+    library_snap: Res<watch_ui::LibrarySnapshotRes>,
 ) {
     // Snapshot the current cursor depending on which menu level is
     // active. We work in usize-space inside this system and write back
-    // to engine_res.cursor / submenu_cursor at the end.
+    // to engine_res.cursor / submenu_cursor at the end. WatchSubmenu's
+    // `n` comes from the live library snapshot (dynamic), not from a
+    // static submenu_for slice.
     let (mut cursor_idx, n) = match engine_res.menu_level {
         MenuLevel::Root => (menu_index_of(engine_res.cursor), MENU.len()),
+        MenuLevel::WatchSubmenu => {
+            let lib_size = library_snap
+                .0
+                .lock()
+                .map(|s| s.entries.len())
+                .unwrap_or(0);
+            (engine_res.submenu_cursor, lib_size)
+        }
         level => (engine_res.submenu_cursor, submenu_for(level).len()),
     };
 
@@ -1380,6 +1423,10 @@ fn gamepad_event_system(
         engine_res.since_input = Duration::ZERO;
         match ev.button {
             GamepadButton::DPadUp => {
+                if n == 0 {
+                    info!("DPadUp ignored — empty submenu (e.g., WatchSubmenu with no library)");
+                    continue;
+                }
                 cursor_idx = if cursor_idx == 0 {
                     n - 1
                 } else {
@@ -1393,6 +1440,10 @@ fn gamepad_event_system(
                 );
             }
             GamepadButton::DPadDown => {
+                if n == 0 {
+                    info!("DPadDown ignored — empty submenu");
+                    continue;
+                }
                 cursor_idx = (cursor_idx + 1) % n;
                 info!(
                     "DPadDown: level={:?} cursor_idx={}",
@@ -1446,39 +1497,22 @@ fn gamepad_event_system(
                             );
                         }
                         MenuItem::Watch => {
-                            // A on WATCH fires the Phase-7 spela-thin-
-                            // client (Session B 2026-05-21): POST /watch
-                            // → daemon spawns `spela-local <title>` →
-                            // Darwin spela NVENC-transcodes H.264 1080p
-                            // HLS → Shannon mpv decodes (currently SW;
-                            // patched mpv via apt.undo.it for
-                            // --hwdec=drm is the Layer-2 follow-up).
-                            // Debounced (`try_dispatch_watch`) at 2 s
-                            // so two rapid presses don't fire two
-                            // parallel spela-locals (Darwin spela
-                            // serves one stream at a time).
-                            //
-                            // V1 uses a hardcoded smoke title
-                            // (`WATCH_SMOKE_TITLE`); the title-picker
-                            // UX (resume-last vs context-engine vs
-                            // in-Bevy search per kiosk research § 7
-                            // Ranks 1+7) is a separate arc.
-                            //
-                            // Scanout-handoff caveat: stock spela-local
-                            // launches mpv with --vo=drm, which
-                            // conflicts with cage's hold on
-                            // /dev/dri/card0. First-light through this
-                            // button currently requires either (a) the
-                            // kiosk service stopped manually, or (b)
-                            // the patched-mpv + dmabuf-wayland +
-                            // shannon-mode handoff work that lands in
-                            // the cluster of Phase-7 follow-ups
-                            // (Layer-1 cage + Layer-2 patched mpv).
-                            // The daemon /watch route + this button
-                            // wiring are the ARCHITECTURAL touchpoint;
-                            // the handoff is the COMPOSITION question.
-                            info!("Watch: dispatching {:?}", WATCH_SMOKE_TITLE);
-                            try_dispatch_watch(&mut engine_res, &daemon_url, WATCH_SMOKE_TITLE);
+                            // 2026-05-24 (Phase-7 rank-1): A on WATCH now
+                            // opens WatchSubmenu — a browse view backed by
+                            // watch_ui::LibrarySnapshotRes (live poll of
+                            // spela /library). User scrolls with DPad,
+                            // A-on-entry fires try_dispatch_watch with the
+                            // selected raw_name, B returns to Root. The
+                            // pre-this hardcoded WATCH_SMOKE_TITLE path is
+                            // retained as a fallback when the library
+                            // hasn't loaded yet (poller hasn't run, or
+                            // /library unreachable) — in that case A on
+                            // an empty submenu dispatches the smoke title
+                            // so the Watch button is never a dead button.
+                            engine_res.menu_level = MenuLevel::WatchSubmenu;
+                            engine_res.submenu_cursor = 0;
+                            cursor_idx = 0;
+                            info!("Enter WatchSubmenu (library browse)");
                         }
                         // Other tiles (Games, Buses, Sensors): South-arm
                         // wiring pending per the kiosk plan's tile-
@@ -1502,6 +1536,25 @@ fn gamepad_event_system(
                     info!("Music: {} ({})", action, MUSIC_DEFAULT_ENTITY);
                     try_dispatch_media(&mut engine_res, &daemon_url, MUSIC_DEFAULT_ENTITY, action);
                 }
+                MenuLevel::WatchSubmenu => {
+                    // A on a library entry dispatches its raw_name via the
+                    // same try_dispatch_watch path that previously fired
+                    // WATCH_SMOKE_TITLE. Snapshot the title under-lock, then
+                    // release before dispatch (which goes through a daemon
+                    // POST + may block briefly). Empty-library fallback
+                    // dispatches the smoke title so Watch is never dead.
+                    let title = {
+                        let snap = library_snap.0.lock();
+                        match snap {
+                            Ok(s) if cursor_idx < s.entries.len() => {
+                                s.entries[cursor_idx].raw_name.clone()
+                            }
+                            _ => WATCH_SMOKE_TITLE.to_string(),
+                        }
+                    };
+                    info!("Watch (submenu): dispatching {:?}", title);
+                    try_dispatch_watch(&mut engine_res, &daemon_url, &title);
+                }
             },
             GamepadButton::East => match engine_res.menu_level {
                 MenuLevel::Root => {
@@ -1519,6 +1572,12 @@ fn gamepad_event_system(
                     engine_res.menu_level = MenuLevel::Root;
                     engine_res.cursor = MenuItem::Music;
                     cursor_idx = menu_index_of(MenuItem::Music);
+                }
+                MenuLevel::WatchSubmenu => {
+                    info!("Exit WatchSubmenu → Root (cursor restored to Watch)");
+                    engine_res.menu_level = MenuLevel::Root;
+                    engine_res.cursor = MenuItem::Watch;
+                    cursor_idx = menu_index_of(MenuItem::Watch);
                 }
             },
             GamepadButton::North => {
@@ -1570,7 +1629,7 @@ fn gamepad_event_system(
     // Write back the final cursor to the level-appropriate field.
     match engine_res.menu_level {
         MenuLevel::Root => engine_res.cursor = MENU[cursor_idx].item,
-        MenuLevel::LightsSubmenu | MenuLevel::MusicSubmenu => {
+        MenuLevel::LightsSubmenu | MenuLevel::MusicSubmenu | MenuLevel::WatchSubmenu => {
             engine_res.submenu_cursor = cursor_idx
         }
     }
@@ -2489,6 +2548,7 @@ fn current_local_minutes() -> ClockMinutes {
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn menu_render_system(
     engine_res: Res<EngineRes>,
+    library_snap: Res<watch_ui::LibrarySnapshotRes>,
     mut prev_selected: Local<Option<usize>>,
     mut root_label_q: Query<
         (&mut TextColor, &mut Visibility, &MenuLabel),
@@ -2542,16 +2602,67 @@ fn menu_render_system(
         ),
     >,
 ) {
-    if !engine_res.is_changed() {
+    // Re-render on EITHER engine state change OR library snapshot change.
+    // The poller updates the snapshot from a background thread; UI needs
+    // to redraw when the library appears OR an entry's title changes.
+    let library_fingerprint = library_snap
+        .0
+        .lock()
+        .map(|s| s.entries.len())
+        .unwrap_or(0);
+    if !engine_res.is_changed() && !library_snap.is_changed() {
+        // Still re-check if WatchSubmenu and library size changed since last render
+        // — handled implicitly via library_snap.is_changed() above.
         return;
     }
     let in_submenu = !matches!(engine_res.menu_level, MenuLevel::Root);
-    let submenu = submenu_for(engine_res.menu_level);
+    let is_watch = matches!(engine_res.menu_level, MenuLevel::WatchSubmenu);
+    let static_submenu = submenu_for(engine_res.menu_level);
     let selected = if in_submenu {
         engine_res.submenu_cursor
     } else {
         menu_index_of(engine_res.cursor)
     };
+
+    // Build a snapshot of windowed library entries for WatchSubmenu —
+    // taken outside the per-entity loop to keep the lock-hold short.
+    // Each entry is (slot_label, slot_is_selected).
+    let watch_slots: Vec<(String, bool)> = if is_watch {
+        let snap = library_snap.0.lock();
+        match snap {
+            Ok(s) => {
+                let total = s.entries.len();
+                if total == 0 {
+                    let msg = match &s.last_error {
+                        Some(e) => format!("(library unavailable: {})", e),
+                        None => "(loading library…)".to_string(),
+                    };
+                    vec![(msg, false)]
+                } else {
+                    let (window_start, indices) = watch_ui::window_around(selected, total);
+                    indices
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &lib_i)| {
+                            let entry = &s.entries[lib_i];
+                            // Truncate long titles to fit slot width
+                            let label = if entry.display_name.len() > 28 {
+                                format!("{}…", &entry.display_name[..27])
+                            } else {
+                                entry.display_name.clone()
+                            };
+                            let is_selected = window_start + i == selected;
+                            (label, is_selected)
+                        })
+                        .collect()
+                }
+            }
+            Err(_) => vec![("(library locked)".to_string(), false)],
+        }
+    } else {
+        vec![]
+    };
+    let _ = library_fingerprint; // tracked to ensure poll detection wakes us
 
     // Latency diagnostic 2026-05-21: log only when the rendered selection
     // index actually changes (engine_res is_changed fires every tick because
@@ -2588,43 +2699,80 @@ fn menu_render_system(
         *vis = Visibility::Hidden;
     }
 
-    // Tile submenus: inverse of the root menu.
+    // Tile submenus: inverse of the root menu. WatchSubmenu uses
+    // `watch_slots` (windowed library) instead of `static_submenu`; static
+    // path drives LightsSubmenu / MusicSubmenu.
     for (mut text, mut color, mut vis, sub) in sub_label_q.iter_mut() {
-        let tile = submenu.get(sub.index);
-        if let Some(tile) = tile {
-            if text.0 != tile.label {
-                text.0 = tile.label.to_string();
+        if is_watch {
+            // Watch path: render from windowed library snapshot.
+            let slot = watch_slots.get(sub.index);
+            let (label, slot_selected) = match slot {
+                Some((s, sel)) => (s.as_str(), *sel),
+                None => ("", false),
+            };
+            if text.0 != label {
+                text.0 = label.to_string();
             }
+            *vis = if slot.is_some() {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+            color.0 = if slot_selected { OAT_MILK } else { OAT_DIM };
+        } else {
+            // Static path: LightsSubmenu / MusicSubmenu / Root (hidden).
+            let tile = static_submenu.get(sub.index);
+            if let Some(tile) = tile {
+                if text.0 != tile.label {
+                    text.0 = tile.label.to_string();
+                }
+            }
+            *vis = if in_submenu && tile.is_some() {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+            color.0 = if sub.index == selected && in_submenu {
+                OAT_MILK
+            } else {
+                OAT_DIM
+            };
         }
-        *vis = if in_submenu && tile.is_some() {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-        color.0 = if sub.index == selected && in_submenu {
-            OAT_MILK
-        } else {
-            OAT_DIM
-        };
     }
     for (mut text, mut color, mut vis, sub) in sub_icon_q.iter_mut() {
-        let tile = submenu.get(sub.index);
-        if let Some(tile) = tile {
-            let icon = tile.icon.to_string();
-            if text.0 != icon {
-                text.0 = icon;
+        if is_watch {
+            // Watch path: ICON_WATCH for every visible library slot.
+            let slot = watch_slots.get(sub.index);
+            let slot_selected = slot.map(|(_, sel)| *sel).unwrap_or(false);
+            let icon_char = ICON_WATCH.to_string();
+            if text.0 != icon_char {
+                text.0 = icon_char;
             }
+            *vis = if slot.is_some() {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+            color.0 = if slot_selected { OAT_MILK } else { OAT_DIM };
+        } else {
+            let tile = static_submenu.get(sub.index);
+            if let Some(tile) = tile {
+                let icon = tile.icon.to_string();
+                if text.0 != icon {
+                    text.0 = icon;
+                }
+            }
+            *vis = if in_submenu && tile.is_some() {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+            color.0 = if sub.index == selected && in_submenu {
+                OAT_MILK
+            } else {
+                OAT_DIM
+            };
         }
-        *vis = if in_submenu && tile.is_some() {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-        color.0 = if sub.index == selected && in_submenu {
-            OAT_MILK
-        } else {
-            OAT_DIM
-        };
     }
 }
 

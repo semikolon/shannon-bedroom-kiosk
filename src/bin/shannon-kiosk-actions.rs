@@ -363,15 +363,20 @@ async fn lights_handler(
     Path((group, action)): Path<(String, String)>,
 ) -> impl IntoResponse {
     // Resolve group → HA group entity (e.g. "group.bedroom_lights") + map
-    // service → shannon-lights verb. Then shell out to
-    // /usr/local/bin/shannon-lights (direct LAN tinytuya, bypasses the
-    // silent-failing LocalTuya HA integration — see
-    // ~/dotfiles/system/shannon/README.md § "LocalTuya HA integration
-    // silent-failure"). HA group membership stays the SSoT: shannon-lights
-    // queries HA REST for member entity_ids at invocation. tokio
-    // spawn_blocking keeps tokio::process out of Cargo.toml (same constraint
-    // as watch_handler's std::process::Command pattern) while still
-    // capturing stdout so callers see per-device verify-after-set lines.
+    // service → shannon-lights-daemon HTTP verb. Then POST to the
+    // persistent daemon at 127.0.0.1:8081 (warm tinytuya OutletDevices,
+    // ~400ms typical end-to-end vs ~2-2.5s for the v1 subprocess path
+    // dominated by Python+tinytuya import). LocalTuya HA integration is
+    // STILL bypassed here — direct tinytuya in the daemon. HA group
+    // membership stays SSoT: lights-daemon queries HA REST for member
+    // entity_ids (with TTL cache).
+    //
+    // History: v0 used HA REST → LocalTuya (silent-failed 2026-05-24).
+    // v1 shelled out to shannon-lights script (~2.5s per call, Python
+    // startup dominant). v2 (2026-05-24 evening) talks to persistent
+    // shannon-lights-daemon over HTTP — eliminates startup + per-call
+    // reconnect. See ~/dotfiles/system/shannon/README.md
+    // § "LocalTuya HA integration silent-failure".
     match plan_lights(&group, &action, &s.ha) {
         Ok(call) => {
             let verb = match call.service.as_str() {
@@ -386,38 +391,44 @@ async fn lights_handler(
                 }
             };
             let entity = call.entity_id.clone();
-            let verb_owned = verb.to_string();
-            let entity_for_child = entity.clone();
-            let join = tokio::task::spawn_blocking(move || {
-                std::process::Command::new("/usr/local/bin/shannon-lights")
-                    .arg(&verb_owned)
-                    .arg("--group")
-                    .arg(&entity_for_child)
-                    .output()
-            })
-            .await;
-            let result = match join {
-                Ok(Ok(out)) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-                    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-                    json!({
-                        "exit_code": out.status.code(),
-                        "stdout": stdout.lines().take(30).collect::<Vec<_>>(),
-                        "stderr": stderr.lines().take(20).collect::<Vec<_>>(),
-                    })
+            // HA group entity_ids are `[a-z0-9_.]+` — all URL-safe per
+            // RFC 3986 unreserved set. No encoding needed.
+            let daemon_url = format!("http://127.0.0.1:8081/{}?group={}", verb, entity);
+            // Reuse the AppState http client (already shared with other
+            // handlers); a short timeout because lights-daemon should
+            // respond in <1s.
+            let req = s
+                .http
+                .post(&daemon_url)
+                .timeout(std::time::Duration::from_secs(8));
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body: serde_json::Value = resp
+                        .json()
+                        .await
+                        .unwrap_or_else(|e| json!({ "parse_error": e.to_string() }));
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "via": "shannon-lights-daemon",
+                            "group": entity,
+                            "verb": verb,
+                            "http_status": status.as_u16(),
+                            "result": body,
+                        })),
+                    )
                 }
-                Ok(Err(e)) => json!({ "error": format!("spawn shannon-lights: {}", e) }),
-                Err(e) => json!({ "error": format!("join blocking task: {}", e) }),
-            };
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "via": "shannon-lights",
-                    "group": entity,
-                    "verb": verb,
-                    "result": result,
-                })),
-            )
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "via": "shannon-lights-daemon",
+                        "group": entity,
+                        "verb": verb,
+                        "error": format!("daemon unreachable: {}", e),
+                    })),
+                ),
+            }
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
