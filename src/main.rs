@@ -2389,7 +2389,16 @@ fn median_recent(values: &[f64], count: usize) -> Option<f64> {
 }
 
 fn sparkline(values: &[f64]) -> String {
-    const STEPS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    // ASCII fallback (was Unicode Block Elements U+2581-2588 — those rendered
+    // as TOFU/empty rectangles on Shannon's bedroom TV because SharpSans
+    // lacks Block Elements glyphs and Bevy 0.18 doesn't font-fallback for
+    // missing codepoints; live evidence in Fredrik's 2026-05-23 Sensors-page
+    // photo). The ASCII ramp gives ~the same visual density progression and
+    // renders in every font. Tradeoff is slightly less elegant glyphs;
+    // proper fix would be either bundling a Unicode-complete fallback font
+    // and threading per-codepoint fallback through TextSpan, or rendering
+    // sparklines as actual Bevy mesh bars — both deferred.
+    const STEPS: [char; 8] = ['_', '.', ',', '-', '=', '+', '*', '#'];
     let points = values.iter().rev().take(36).copied().collect::<Vec<_>>();
     if points.len() < 2 {
         return "no trace".to_string();

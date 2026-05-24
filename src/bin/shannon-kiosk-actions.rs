@@ -362,12 +362,61 @@ async fn lights_handler(
     State(s): State<Arc<AppState>>,
     Path((group, action)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    // Resolve group → HA group entity (e.g. "group.bedroom_lights") + map
+    // service → shannon-lights verb. Then shell out to
+    // /usr/local/bin/shannon-lights (direct LAN tinytuya, bypasses the
+    // silent-failing LocalTuya HA integration — see
+    // ~/dotfiles/system/shannon/README.md § "LocalTuya HA integration
+    // silent-failure"). HA group membership stays the SSoT: shannon-lights
+    // queries HA REST for member entity_ids at invocation. tokio
+    // spawn_blocking keeps tokio::process out of Cargo.toml (same constraint
+    // as watch_handler's std::process::Command pattern) while still
+    // capturing stdout so callers see per-device verify-after-set lines.
     match plan_lights(&group, &action, &s.ha) {
         Ok(call) => {
-            let status = send(&s.http, &s.ha, &call).await;
+            let verb = match call.service.as_str() {
+                "turn_on" => "on",
+                "turn_off" => "off",
+                "toggle" => "toggle",
+                other => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("unknown service: {}", other) })),
+                    );
+                }
+            };
+            let entity = call.entity_id.clone();
+            let verb_owned = verb.to_string();
+            let entity_for_child = entity.clone();
+            let join = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("/usr/local/bin/shannon-lights")
+                    .arg(&verb_owned)
+                    .arg("--group")
+                    .arg(&entity_for_child)
+                    .output()
+            })
+            .await;
+            let result = match join {
+                Ok(Ok(out)) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                    json!({
+                        "exit_code": out.status.code(),
+                        "stdout": stdout.lines().take(30).collect::<Vec<_>>(),
+                        "stderr": stderr.lines().take(20).collect::<Vec<_>>(),
+                    })
+                }
+                Ok(Err(e)) => json!({ "error": format!("spawn shannon-lights: {}", e) }),
+                Err(e) => json!({ "error": format!("join blocking task: {}", e) }),
+            };
             (
                 StatusCode::OK,
-                Json(json!({ "call": describe_call(&call), "result": status })),
+                Json(json!({
+                    "via": "shannon-lights",
+                    "group": entity,
+                    "verb": verb,
+                    "result": result,
+                })),
             )
         }
         Err(e) => (
