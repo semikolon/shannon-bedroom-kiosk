@@ -813,7 +813,14 @@ const X_ALL_TOGGLE_GROUPS: &[&str] = &["bedroom", "office"];
 /// serves one stream at a time — duplicate triggers race the
 /// stream-replacement path). 2 s is generous enough for "did it
 /// register?" double-presses without imposing perceptible lag.
-const WATCH_DEBOUNCE_MS: u64 = 2000;
+// 2026-05-24 evening: 2000ms was too short — spela-local cold-start is
+// 20-60s and user gets zero visual feedback during it, so they re-press
+// thinking the first press missed. Both presses fire (>2s apart), both
+// spawn parallel spela-local sessions, both race for /play, get smart-
+// resume confusion + Path A→B fallback. Bumped to 30s + paired with the
+// pending_watch overlay so user sees "STARTING <title>..." immediately
+// and trusts the first press.
+const WATCH_DEBOUNCE_MS: u64 = 30000;
 
 /// Default smoke-test title for the Watch tile (Phase-7 Layer-4b v1).
 /// Fredrik's canonical spela search example — used throughout spela
