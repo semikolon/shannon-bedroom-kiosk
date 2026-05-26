@@ -540,6 +540,23 @@ fn preview_for(item: MenuItem) -> (char, &'static str, &'static str) {
 
 // ─── App entry ──────────────────────────────────────────────────────
 
+/// Active polling interval (controller responsiveness latency ceiling).
+/// 10 ms = A/B-verified median latency 67 ms vs 125 ms at 33 ms.
+/// See dotfiles TODO § "DPad→Bevy→render latency measurement" (2026-05-21).
+const ACTIVE_WAIT_MS: u64 = 10;
+/// Idle polling interval — reached after IDLE_THRESHOLD_SECS of no
+/// controller input. Worst-case first-press latency after idle ≈ this
+/// value. 50 ms is the sweet spot: 5x CPU reduction (21% → ~4% idle),
+/// first-press lag invisible as "wake-up" tax. Any input resets to
+/// ACTIVE_WAIT_MS immediately for normal navigation.
+const IDLE_WAIT_MS: u64 = 50;
+/// How long without controller input before dropping to IDLE_WAIT_MS.
+/// 3 s = balance between "idle quickly" (CPU win) vs "stay responsive
+/// during brief pauses between menu actions" (UX). Watch for navigation
+/// patterns: if Fredrik habitually pauses >3 s between presses during
+/// active use, raise this to 5 s.
+const IDLE_THRESHOLD_SECS: u64 = 3;
+
 fn main() {
     App::new()
         .insert_resource({
@@ -560,15 +577,23 @@ fn main() {
             // The prior SHANNON_KIOSK_CONTINUOUS env-gate was dropped as
             // dead code post-A/B: continuous mode delivered only marginal
             // median win and the slow-tail wasn't Bevy-flag-solvable.
+            //
+            // 2026-05-26 — dynamic wait: dynamic_wait_system raises wait
+            // from ACTIVE_WAIT_MS to IDLE_WAIT_MS after IDLE_THRESHOLD_SECS
+            // of no controller input → 5x idle-CPU reduction (21% → ~4%)
+            // while preserving the 67 ms median input latency for normal
+            // navigation. First-press-after-idle worst-case ≈ IDLE_WAIT_MS
+            // ms; subsequent presses immediately drop back to active wait.
+            // Initial value = ACTIVE so first-frame input is snappy.
             WinitSettings {
                 focused_mode: bevy::winit::UpdateMode::Reactive {
-                    wait: Duration::from_millis(10),
+                    wait: Duration::from_millis(ACTIVE_WAIT_MS),
                     react_to_device_events: true,
                     react_to_user_events: true,
                     react_to_window_events: true,
                 },
                 unfocused_mode: bevy::winit::UpdateMode::Reactive {
-                    wait: Duration::from_millis(10),
+                    wait: Duration::from_millis(ACTIVE_WAIT_MS),
                     react_to_device_events: true,
                     react_to_user_events: true,
                     react_to_window_events: true,
@@ -676,6 +701,7 @@ fn main() {
                 gamepad_event_system,
                 keyboard_event_system,
                 engine_tick_system,
+                dynamic_wait_system,
                 menu_render_system,
                 preview_render_system,
                 dashboard_preview_render_system,
@@ -1769,6 +1795,64 @@ fn keyboard_event_system(
         engine_res.dev_keyboard_active = true;
         engine_res.cursor = MENU[cursor_idx].item;
     }
+}
+
+/// Dynamic-wait adjuster: lowers the Bevy event-loop wait from
+/// ACTIVE_WAIT_MS to IDLE_WAIT_MS after IDLE_THRESHOLD_SECS of no
+/// controller input. Reduces idle CPU ~5x (21% → ~4%) while preserving
+/// the 67 ms median input latency for active navigation (any input
+/// resets `since_input` → next tick of this system restores ACTIVE_WAIT).
+///
+/// Must run AFTER `engine_tick_system` so `since_input` is already
+/// updated for this frame. Mutates WinitSettings, which the winit
+/// runner reads at the end of each loop iteration to schedule the
+/// next wake — so the new wait takes effect on the NEXT iteration.
+///
+/// Why this works without degrading the bevy_gilrs latency tradeoff:
+/// the wait only relaxes when no input has arrived for IDLE_THRESHOLD
+/// seconds — i.e., when the user is demonstrably NOT actively using
+/// the kiosk. The first input after idle costs up to IDLE_WAIT_MS of
+/// "wake-up tax" (one tick); subsequent inputs immediately see
+/// ACTIVE_WAIT_MS again. Acceptable trade since first-press after
+/// idle is psychologically a "wake-up" action, not a navigation
+/// action.
+fn dynamic_wait_system(
+    engine_res: Res<EngineRes>,
+    mut settings: ResMut<WinitSettings>,
+) {
+    let target_wait_ms = if engine_res.since_input
+        < Duration::from_secs(IDLE_THRESHOLD_SECS)
+    {
+        ACTIVE_WAIT_MS
+    } else {
+        IDLE_WAIT_MS
+    };
+    let target_wait = Duration::from_millis(target_wait_ms);
+
+    // Only mutate if changed (Bevy's change-detection triggers WinitSettings
+    // re-read; avoid spurious re-reads on every frame).
+    let current_wait = match settings.focused_mode {
+        bevy::winit::UpdateMode::Reactive { wait, .. } => wait,
+        _ => Duration::ZERO,
+    };
+    if current_wait == target_wait {
+        return;
+    }
+
+    let new_mode = bevy::winit::UpdateMode::Reactive {
+        wait: target_wait,
+        react_to_device_events: true,
+        react_to_user_events: true,
+        react_to_window_events: true,
+    };
+    settings.focused_mode = new_mode;
+    settings.unfocused_mode = new_mode;
+    info!(
+        "dynamic_wait: {} -> {} ms (since_input={:.1}s)",
+        current_wait.as_millis(),
+        target_wait_ms,
+        engine_res.since_input.as_secs_f32()
+    );
 }
 
 fn engine_tick_system(
