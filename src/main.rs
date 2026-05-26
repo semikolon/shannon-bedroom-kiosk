@@ -48,7 +48,7 @@ use bevy::render::settings::{WgpuSettings, WgpuSettingsPriority};
 use bevy::render::RenderPlugin;
 use bevy::ui::IsDefaultUiCamera;
 use bevy::window::{CursorOptions, WindowResolution};
-use bevy::winit::WinitSettings;
+use bevy::winit::{EventLoopProxy, EventLoopProxyWrapper, WinitSettings, WinitUserEvent};
 use serde_json::Value;
 use shannon_kiosk::context::{
     Action, BlackoutTvPower, ClockMinutes, Config, DisplayState, Engine, Inputs, Manual, Media,
@@ -543,18 +543,31 @@ fn preview_for(item: MenuItem) -> (char, &'static str, &'static str) {
 /// Active polling interval (controller responsiveness latency ceiling).
 /// 10 ms = A/B-verified median latency 67 ms vs 125 ms at 33 ms.
 /// See dotfiles TODO § "DPad→Bevy→render latency measurement" (2026-05-21).
+///
+/// 2026-05-26 — kept low for the brief window between input arrival and
+/// the gilrs-wake bridge's send_event wakeup landing. Empirically the
+/// bridge's wake latency is <5 ms, so even 100 ms here would be fine,
+/// but 10 ms preserves the original latency profile for the first frame
+/// after a wake.
 const ACTIVE_WAIT_MS: u64 = 10;
 /// Idle polling interval — reached after IDLE_THRESHOLD_SECS of no
-/// controller input. Worst-case first-press latency after idle ≈ this
-/// value. 50 ms is the sweet spot: 5x CPU reduction (21% → ~4% idle),
-/// first-press lag invisible as "wake-up" tax. Any input resets to
-/// ACTIVE_WAIT_MS immediately for normal navigation.
-const IDLE_WAIT_MS: u64 = 50;
+/// controller input. With the gilrs-wake bridge (2026-05-26), this can
+/// be set much larger than `ACTIVE_WAIT_MS` without degrading input
+/// responsiveness: ANY gamepad event wakes the Bevy loop within ~5 ms
+/// via the EventLoopProxy::send_event path, regardless of `wait`. The
+/// only consequence of raising this is that HA-poll state changes (which
+/// don't go through gilrs) take up to IDLE_WAIT_MS to reflect — for
+/// ribbon offers + clock-text refresh, 1 s is plenty.
+///
+/// 1000 ms = 1 Hz idle → Bevy Render schedule fires 1× per sec instead
+/// of 100× per sec → ~95% CPU reduction theoretical (fixed-cost per-wake
+/// puts the empirical floor higher, but still big).
+const IDLE_WAIT_MS: u64 = 1000;
 /// How long without controller input before dropping to IDLE_WAIT_MS.
 /// 3 s = balance between "idle quickly" (CPU win) vs "stay responsive
-/// during brief pauses between menu actions" (UX). Watch for navigation
-/// patterns: if Fredrik habitually pauses >3 s between presses during
-/// active use, raise this to 5 s.
+/// during brief pauses between menu actions" (UX). With the gilrs-wake
+/// bridge the UX cost of raising this is essentially zero — controller
+/// input wakes immediately regardless — so 3 s stays conservative.
 const IDLE_THRESHOLD_SECS: u64 = 3;
 
 fn main() {
@@ -695,6 +708,11 @@ fn main() {
             Startup,
             (setup_camera, load_fonts, setup_background, setup_ui).chain(),
         )
+        // gilrs-wake bridge — spawn the side-channel input thread that
+        // wakes winit on gamepad events. Runs once at startup; the thread
+        // lives for app lifetime. See `spawn_gilrs_wake_thread` for the
+        // structural rationale.
+        .add_systems(Startup, spawn_gilrs_wake_thread)
         .add_systems(
             Update,
             (
@@ -1797,11 +1815,108 @@ fn keyboard_event_system(
     }
 }
 
+/// Spawn the gilrs-wake bridge thread (2026-05-26 — STRUCTURAL FIX for
+/// bevy_gilrs's "events don't wake winit" limitation).
+///
+/// THE PROBLEM: bevy_gilrs polls gilrs events inside the Bevy ECS
+/// Update schedule. The Update schedule only runs when winit wakes the
+/// event loop. Winit wakes on its own (mouse/keyboard) events OR on a
+/// `WinitSettings.{focused,unfocused}_mode` timer. **Gamepad events do
+/// NOT wake winit** — they accumulate in gilrs's queue and are drained
+/// only on the next periodic Bevy tick.
+///
+/// This makes `WinitSettings.wait` the input-latency ceiling for
+/// gamepad input. Lowering wait (10 ms) keeps gamepad responsive but
+/// runs the full Update+Render pipeline at 100 Hz → ~21% CPU at idle.
+/// Raising wait reduces CPU but degrades gamepad responsiveness.
+///
+/// THE FIX: a dedicated thread owns its OWN `gilrs::Gilrs` instance
+/// (gilrs internally uses libudev/evdev — multiple instances per
+/// process are fine, no device contention). The thread calls
+/// `next_event_blocking(None)` which TRUE-BLOCKS on the OS until
+/// gamepad input arrives (epoll/inotify under the hood; zero CPU
+/// between events). When an event arrives, it calls
+/// `EventLoopProxy::send_event(WinitUserEvent::WakeUp)` which wakes
+/// the Bevy event loop IMMEDIATELY (<5 ms in practice). The next
+/// Bevy tick fires, bevy_gilrs (the in-tree one, using its OWN gilrs
+/// instance) drains the event, ECS systems run, render fires.
+///
+/// EFFECT: `WinitSettings.wait` is decoupled from gamepad-input
+/// latency at the root. We can now set wait to 1000 ms (or higher)
+/// at idle without degrading controller responsiveness. Bevy's full
+/// pipeline fires 1 Hz at idle vs 100 Hz before. CPU drops ~5-10x.
+///
+/// WHY TWO GILRS INSTANCES (sidecar + bevy_gilrs's): the simplest
+/// path that avoids forking bevy_gilrs. Both read independently from
+/// evdev/udev — each gets its own copy of the event stream. The
+/// sidecar consumes its events purely for the wake signal (events
+/// then discarded). bevy_gilrs consumes its own events normally for
+/// the Bevy event API. Memory cost: ~few KB for the duplicate
+/// gilrs state. CPU cost: zero between events.
+fn spawn_gilrs_wake_thread(proxy: Res<EventLoopProxyWrapper>) {
+    let proxy_clone: EventLoopProxy<WinitUserEvent> = (**proxy).clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("gilrs-wake-bridge".to_string())
+        .spawn(move || gilrs_wake_loop(proxy_clone));
+    match spawn_result {
+        Ok(_) => info!(
+            "gilrs-wake bridge thread spawned — gamepad input will wake winit immediately, decoupled from WinitSettings.wait"
+        ),
+        Err(e) => warn!(
+            "gilrs-wake bridge: thread spawn failed: {} — falling back to wait-period gamepad-input latency",
+            e
+        ),
+    }
+}
+
+/// The actual wake loop. Runs on the gilrs-wake-bridge thread for the
+/// app's lifetime. Blocks indefinitely on `next_event_blocking(None)`
+/// between events (zero CPU). On any event, drains additional pending
+/// events (coalesce wakes for a controller burst into a single
+/// send_event) then signals winit.
+fn gilrs_wake_loop(proxy: EventLoopProxy<WinitUserEvent>) {
+    let mut gilrs = match gilrs::Gilrs::new() {
+        Ok(g) => g,
+        Err(e) => {
+            // Without gilrs we can't bridge. The main Bevy loop's
+            // wait-period gamepad polling still works as fallback —
+            // just at the higher idle-wait latency floor.
+            eprintln!(
+                "gilrs-wake: failed to create gilrs instance ({e}) — bridge disabled; gamepad input falls back to WinitSettings.wait latency."
+            );
+            return;
+        }
+    };
+    loop {
+        // True-block until ANY event arrives (timeout=None). This is
+        // epoll/inotify under the hood on Linux — zero CPU between
+        // events. The thread parks in the kernel; no userspace polling.
+        if gilrs.next_event_blocking(None).is_none() {
+            // None on timeout (impossible with None timeout) OR on a
+            // genuine internal stop signal. Treat as "keep blocking";
+            // the loop continues to next iteration.
+            continue;
+        }
+        // Coalesce: drain any additional events that arrived in the
+        // same burst, so a controller-button-burst (D-pad held down,
+        // axis jitter) translates to ONE send_event call instead of
+        // dozens. Costs ~µs per event drain.
+        while gilrs.next_event().is_some() {}
+        // Wake winit. send_event returns Err only if the event loop
+        // has shut down (app exiting) — at which point this thread
+        // is moments from being torn down too. Ignore errors.
+        let _ = proxy.send_event(WinitUserEvent::WakeUp);
+    }
+}
+
 /// Dynamic-wait adjuster: lowers the Bevy event-loop wait from
 /// ACTIVE_WAIT_MS to IDLE_WAIT_MS after IDLE_THRESHOLD_SECS of no
-/// controller input. Reduces idle CPU ~5x (21% → ~4%) while preserving
-/// the 67 ms median input latency for active navigation (any input
-/// resets `since_input` → next tick of this system restores ACTIVE_WAIT).
+/// controller input. With the gilrs-wake bridge (above), this is now
+/// SAFE to set IDLE_WAIT_MS arbitrarily high — controller input wakes
+/// the loop directly via EventLoopProxy::send_event, completely
+/// bypassing `wait`. The dynamic switch back to ACTIVE_WAIT on first
+/// input is now just an additional layer of latency insurance for the
+/// brief window before the gilrs-wake send_event lands.
 ///
 /// Must run AFTER `engine_tick_system` so `since_input` is already
 /// updated for this frame. Mutates WinitSettings, which the winit

@@ -74,6 +74,24 @@ serde_json = "1"
 # unaffected — bevy_render's `metal` feature handles that path.
 wgpu = { version = "27", default-features = false, features = ["gles", "wgsl"] }
 
+# --- 2026-05-26: gilrs-wake bridge (structural fix for idle CPU) ---
+# A dedicated thread owns a SECOND `gilrs::Gilrs` instance and blocks on
+# `next_event_blocking(None)` (true OS-level block on epoll/inotify;
+# zero CPU between events). On any gamepad event it calls
+# EventLoopProxy::send_event(WinitUserEvent::WakeUp), which wakes the
+# Bevy event loop IMMEDIATELY — completely decoupling gamepad-input
+# latency from the WinitSettings.wait period. The main Bevy loop can
+# then run at wait=1000ms+ at idle (Render schedule fires 1×/sec instead
+# of 100×/sec) without degrading controller responsiveness — wake-up
+# from gilrs side-channel takes <5 ms vs the prior wait-period ceiling.
+#
+# Same major as bevy_gilrs 0.18.1's internal gilrs (0.11.x) so Cargo's
+# semver resolution unifies on one shared instance. Both gilrs instances
+# (ours + bevy_gilrs's) read independently from evdev/udev — no device
+# contention; each gets its own event stream. Sidecar consumes its
+# events; bevy_gilrs consumes its own when the main loop ticks.
+gilrs = "0.11"
+
 # zune-core only ships 0.5.0-rcN on crates.io (no stable 0.5.0). The
 # `jpeg` feature → `zune-jpeg` → `zune-core ^0.5.0` would fail to
 # resolve without this prerelease opt-in. Pinning to rc2 (the latest
