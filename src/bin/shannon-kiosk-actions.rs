@@ -511,8 +511,31 @@ async fn watch_handler(Json(req): Json<WatchReq>) -> impl IntoResponse {
         );
     }
 
+    // Magnet validation (2026-05-26): defense at the daemon boundary even
+    // though Darwin spela does its own validate_magnet_uri at /play time.
+    // Reject control chars (same hygiene as title); cap at 4096 bytes
+    // (typical magnet is 400-600 chars; 4096 is generous, blocks abuse).
+    let magnet_owned = match req.magnet.as_deref() {
+        None => None,
+        Some(m) if m.is_empty() => None,
+        Some(m) if m.len() > 4096 => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "magnet too long (>4096 bytes)" })),
+            );
+        }
+        Some(m) if m.chars().any(|c| c.is_control()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "magnet contains control characters" })),
+            );
+        }
+        Some(m) => Some(m.to_string()),
+    };
+
     let title_owned = title.to_string();
     let smoke_secs = req.smoke;
+    let file_index = req.file_index;
 
     let spawn_result = std::thread::Builder::new()
         .name(format!("watch-spawn-{}", title_owned.replace(' ', "-")))
@@ -521,6 +544,12 @@ async fn watch_handler(Json(req): Json<WatchReq>) -> impl IntoResponse {
             cmd.arg(&title_owned);
             if let Some(secs) = smoke_secs {
                 cmd.arg("--smoke").arg(secs.to_string());
+            }
+            if let Some(m) = magnet_owned.as_ref() {
+                cmd.arg("--magnet").arg(m);
+            }
+            if let Some(idx) = file_index {
+                cmd.arg("--file-index").arg(idx.to_string());
             }
             // Detach stdin/stdout/stderr from the daemon's tty so the
             // child can outlive any controlling terminal cleanly. mpv
@@ -561,6 +590,17 @@ struct WatchReq {
     title: String,
     #[serde(default)]
     smoke: Option<u32>,
+    // 2026-05-26 — magnet/file_index passthrough from Darwin spela's
+    // target=shannon dispatch. When the web remote picks a specific
+    // result_id, Darwin resolves it via its own last_search and sends
+    // the exact magnet here so spela-local can SKIP its own /search
+    // round-trip + POST /play with the exact release the user picked.
+    // Without this, Shannon's own /search + /play 1 races against the
+    // ranker (Torrentio order non-deterministic across requests).
+    #[serde(default)]
+    magnet: Option<String>,
+    #[serde(default)]
+    file_index: Option<u32>,
 }
 
 /// Send a planned HA call. Returns a short result tag (never panics; a
