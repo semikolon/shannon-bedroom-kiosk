@@ -559,10 +559,15 @@ const ACTIVE_WAIT_MS: u64 = 10;
 /// don't go through gilrs) take up to IDLE_WAIT_MS to reflect — for
 /// ribbon offers + clock-text refresh, 1 s is plenty.
 ///
-/// 1000 ms = 1 Hz idle → Bevy Render schedule fires 1× per sec instead
-/// of 100× per sec → ~95% CPU reduction theoretical (fixed-cost per-wake
-/// puts the empirical floor higher, but still big).
-const IDLE_WAIT_MS: u64 = 1000;
+/// 5000 ms = 0.2 Hz idle → Bevy Render fires once every 5 seconds when
+/// idle. UX trade: HA-driven ribbon offers (paused-media resume tile,
+/// occupancy state) refresh within ≤5 s of HA snapshot update vs ≤1 s
+/// previously. Clock display only shows date (no seconds), so static.
+/// All input-driven UI (cursor, menu highlight, submenu pop) is instant
+/// via the gilrs-wake bridge regardless of wait. Trade is invisible
+/// for a glanceable kiosk. 2026-05-26 bumped 1000 → 5000 per Try-10-
+/// minutes-first; pushes main-thread fixed-cost floor 1.75% → ~0.4%.
+const IDLE_WAIT_MS: u64 = 5000;
 /// How long without controller input before dropping to IDLE_WAIT_MS.
 /// 3 s = balance between "idle quickly" (CPU win) vs "stay responsive
 /// during brief pauses between menu actions" (UX). With the gilrs-wake
