@@ -73,9 +73,25 @@ const LUCIDE: &[u8] = include_bytes!("../assets/fonts/Lucide.ttf");
 
 // ─── Embedded background image ──────────────────────────────────────
 const BG_IMAGE: &[u8] = include_bytes!("../assets/backgrounds/sarpetorp-clock-bg.jpg");
-const BG_FIT_WIDTH: f32 = 1920.0;
+// 2026-05-28: red-burlap atmospheric backdrop CONSTRAINED to the
+// right main area only (was full-screen 1920×3063 centered at 0).
+// Fredrik's report: "red texture overlapping the left menu sidebar
+// and thus obscuring the green color that's supposed to be faded
+// with the wood panel texture." The full-screen red at 20% alpha
+// bled THROUGH the wood ImageNode (40% alpha = 60% see-through),
+// muddying the green-tinted-wood look into red-brown mud. By
+// constraining the sprite to span x=-420 (= sidebar right edge,
+// 540-960 in centered-origin coords) to x=+960 (right edge of
+// screen), the sidebar zone now sees ONLY FOREST_BG + wood —
+// "wood faded with green" as designed.
+const BG_FIT_WIDTH: f32 = 1380.0; // = 1920 - SIDEBAR_WIDTH (540)
 const BG_FIT_HEIGHT: f32 = 3063.0;
 const BG_OPACITY: f32 = 0.20;
+// X-offset to center the right-area sprite from x=-420 to x=+960.
+// (Bevy 2D coord system: window 1920 wide → x ∈ [-960, +960];
+// sidebar takes left 540 px = x ∈ [-960, -420]; right area starts
+// at x=-420 and ends at x=+960; midpoint = (-420 + 960)/2 = +270.)
+const BG_X_OFFSET: f32 = 270.0;
 
 // ─── Sidebar wood-panel background (mirrors Sarpetorp dashboard
 // INOMHUS widget, App.tsx:97). The dashboard's 0.12 opacity sits on a
@@ -1068,7 +1084,7 @@ fn setup_background(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
             color: Color::srgba(1.0, 1.0, 1.0, BG_OPACITY),
             ..default()
         },
-        Transform::from_xyz(0.0, 0.0, -1.0),
+        Transform::from_xyz(BG_X_OFFSET, 0.0, -1.0),
     ));
 
     // Load the sidebar wood-panel image; the actual rendering is done in
