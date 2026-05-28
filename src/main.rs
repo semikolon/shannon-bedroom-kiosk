@@ -65,6 +65,7 @@ const OAT_FAINT: Color = Color::srgb(0.38, 0.39, 0.36); // tertiary text
 const AMBER_ACCENT: Color = Color::srgb(0.94, 0.71, 0.18); // selected + [A]
 
 mod now_playing;
+mod posters;
 mod watch_ui;
 
 // ─── Embedded font assets (commit-time bundled into the binary) ──────
@@ -534,6 +535,15 @@ enum NowPlayingElement {
     Hint,
 }
 
+/// Phase-7 Phase 2A (2026-05-28) — poster preview shown to the right of
+/// the library text list while WatchSubmenu is active. Single entity;
+/// the `watch_poster_preview_system` sets its image handle to the
+/// currently-cursor'd entry's poster (downloaded async by the poster
+/// thread). Hidden when no poster is available (entry has no poster_url
+/// OR download still in flight OR download failed).
+#[derive(Component)]
+struct WatchPosterPreview;
+
 #[derive(Component)]
 struct StateBadge;
 
@@ -741,6 +751,14 @@ fn main() {
                 .unwrap_or(2);
             now_playing::spawn_now_playing_poller(base_url, Duration::from_secs(interval_secs))
         })
+        .insert_resource({
+            // Poster downloader (Phase-7 Phase 2A, 2026-05-28): downloads
+            // TMDB poster JPEGs in a background thread + caches the
+            // bytes in a shared registry; main-thread systems promote
+            // bytes→Handle<Image> as they arrive. 8s per-request timeout
+            // is generous for ~80 KB posters over the home WiFi.
+            posters::spawn_poster_downloader(Duration::from_secs(8))
+        })
         .add_plugins(
             DefaultPlugins
                 .set(RenderPlugin {
@@ -797,6 +815,9 @@ fn main() {
                 state_badge_system,
                 pending_watch_overlay_system,
                 now_playing_render_system,
+                watch_poster_request_system,
+                watch_poster_promote_system,
+                watch_poster_preview_system,
             ),
         )
         .run();
@@ -1665,6 +1686,34 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         },
         Visibility::Hidden,
         NowPlayingElement::Hint,
+    ));
+
+    // ─── Phase 2A: Watch UI poster preview ────────────────────────────
+    // Single large poster image to the right of the library text list.
+    // Position: top-right area of the canvas, 460×690 px (TMDB w500
+    // posters are 500×750 — 460×690 preserves the aspect at the kiosk's
+    // visual budget). Image handle is updated per-tick by
+    // `watch_poster_preview_system` based on the cursor entry's
+    // poster_url; visibility flips when no poster is available so the
+    // text list can stand on its own at the cursor position.
+    commands.spawn((
+        ImageNode {
+            // Placeholder transparent image — the render system swaps
+            // in real handles as they arrive. Bevy's `ImageNode::default()`
+            // gives a 1×1 transparent image which works as the no-poster
+            // visual baseline.
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(160.0),
+            left: Val::Px(1310.0),
+            width: Val::Px(460.0),
+            height: Val::Px(690.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        WatchPosterPreview,
     ));
 }
 
@@ -3315,6 +3364,146 @@ fn pending_watch_overlay_system(
     // re-evaluate the timeout every tick forever.
     if !visible && engine_res.pending_watch.is_some() {
         engine_res.pending_watch = None;
+    }
+}
+
+/// Phase-7 Phase 2A (2026-05-28) — drive the poster pipeline. Three
+/// systems chained via the shared `PosterRegistry`:
+///
+/// 1. `watch_poster_request_system` — scans the library snapshot and
+///    requests downloads for visible entries (currently: ALL entries,
+///    since the library is small and TMDB CDN caches well). De-duped
+///    inside `PosterRegistry::request` so re-fires are no-ops.
+/// 2. `watch_poster_promote_system` — scans the registry for entries
+///    in `Bytes` state, decodes them via `Image::from_buffer` (uses
+///    Bevy's `jpeg` feature already in Cargo.toml), inserts the asset
+///    into `Assets<Image>`, and upgrades the registry entry to `Handle`.
+/// 3. `watch_poster_preview_system` — paints the `WatchPosterPreview`
+///    `ImageNode` with the cursor entry's handle while WatchSubmenu is
+///    active. Hides the preview when no poster is available (no URL,
+///    pending, or failed).
+fn watch_poster_request_system(
+    library_snap: Res<watch_ui::LibrarySnapshotRes>,
+    registry: Res<posters::PosterRegistry>,
+) {
+    // Only fire when the library snapshot changes (new entries arrived
+    // from the poller). Otherwise every tick would re-request every
+    // poster — wasteful even if `request()` dedupes internally.
+    if !library_snap.is_changed() {
+        return;
+    }
+    let urls: Vec<String> = match library_snap.0.lock() {
+        Ok(s) => s
+            .entries
+            .iter()
+            .filter_map(|e| e.poster_url.clone())
+            .collect(),
+        Err(_) => return,
+    };
+    for url in urls {
+        registry.request(&url);
+    }
+}
+
+fn watch_poster_promote_system(
+    registry: Res<posters::PosterRegistry>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
+    // Collect URL → bytes for entries needing promotion. We collect
+    // first so we can release the registry lock before doing the
+    // (potentially-expensive) JPEG decode + Assets<Image> insert.
+    let pending: Vec<(String, Vec<u8>)> = match registry.entries.lock() {
+        Ok(map) => map
+            .iter()
+            .filter_map(|(url, status)| {
+                if let posters::PosterStatus::Bytes(b) = status {
+                    Some((url.clone(), b.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    if pending.is_empty() {
+        return;
+    }
+    // Decode + insert each. On decode failure, mark Failed so we don't
+    // re-decode the same broken JPEG every tick.
+    for (url, bytes) in pending {
+        let image_result = Image::from_buffer(
+            &bytes,
+            ImageType::Format(bevy::image::ImageFormat::Jpeg),
+            CompressedImageFormats::NONE,
+            true, // sRGB — TMDB posters are sRGB JPEGs
+            ImageSampler::Default,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        match image_result {
+            Ok(image) => {
+                let handle = images.add(image);
+                if let Ok(mut map) = registry.entries.lock() {
+                    map.insert(url, posters::PosterStatus::Handle(handle));
+                }
+            }
+            Err(e) => {
+                if let Ok(mut map) = registry.entries.lock() {
+                    map.insert(url, posters::PosterStatus::Failed(format!("decode: {}", e)));
+                }
+            }
+        }
+    }
+}
+
+fn watch_poster_preview_system(
+    engine_res: Res<EngineRes>,
+    library_snap: Res<watch_ui::LibrarySnapshotRes>,
+    registry: Res<posters::PosterRegistry>,
+    mut q: Query<(&mut ImageNode, &mut Visibility), With<WatchPosterPreview>>,
+) {
+    // Only fire on relevant changes — engine state (cursor moves) OR
+    // library snapshot (new entries / poster URLs) OR registry (download
+    // completion). The Bevy `is_changed` on a `Res<PosterRegistry>` only
+    // fires when the resource itself is replaced (never, here); we
+    // conservatively run every tick since the work is cheap (a single
+    // HashMap lookup + handle clone).
+    let visible = matches!(engine_res.menu_level, MenuLevel::WatchSubmenu);
+    if !visible {
+        for (_, mut vis) in q.iter_mut() {
+            *vis = Visibility::Hidden;
+        }
+        return;
+    }
+    // Find the cursor entry's poster URL.
+    let cursor = engine_res.submenu_cursor;
+    let poster_url = match library_snap.0.lock() {
+        Ok(s) if cursor < s.entries.len() => s.entries[cursor].poster_url.clone(),
+        _ => None,
+    };
+    // Resolve URL → Handle via the registry. If not a Handle yet
+    // (Pending / Bytes / Failed / missing) we hide the preview.
+    let handle = match poster_url.as_deref() {
+        Some(url) => match registry.entries.lock() {
+            Ok(map) => match map.get(url) {
+                Some(posters::PosterStatus::Handle(h)) => Some(h.clone()),
+                _ => None,
+            },
+            Err(_) => None,
+        },
+        None => None,
+    };
+    for (mut image_node, mut vis) in q.iter_mut() {
+        match handle.clone() {
+            Some(h) => {
+                image_node.image = h;
+                *vis = Visibility::Inherited;
+            }
+            None => {
+                *vis = Visibility::Hidden;
+            }
+        }
     }
 }
 
