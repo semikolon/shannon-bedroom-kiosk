@@ -102,9 +102,20 @@ fn build_pipeline(hls_url: &str, audio_device: &str) -> Result<gst::Pipeline, St
     // breakthrough: extra elements between decoder and sink trigger
     // the playbin3-sandwich autoplug pattern that pegs CPU at 99%).
     // waylandsink natively handles DMABuf-with-VideoMeta via wl_buffer.
+    //
+    // 2026-05-29 — queue tuning per spela TODO Rank 8 perf probe finding:
+    // souphttpsrc + queue management was ~7-12% of the 32% total CPU.
+    // The 200-buffer / unlimited-time cap means the queue empties between
+    // HLS segment fetches, forcing souphttpsrc to spike at fetch time.
+    // Switch to a TIME-based cap (10 seconds of video) so the queue stays
+    // full across segment boundaries and souphttpsrc's pulses smooth out.
+    // 10s * 30fps = ~300 frames @ 1080p H.264 ~6 Mbps ≈ 7.5 MB — well
+    // within Shannon's 4 GB RAM. max-size-buffers raised to 600 as a
+    // safety ceiling against bursty keyframe densities.
+    const QUEUE_TIME_NS: u64 = 10_000_000_000; // 10 seconds
     let video_queue = gst::ElementFactory::make("queue")
-        .property_from_str("max-size-buffers", "200")
-        .property("max-size-time", 0u64)
+        .property_from_str("max-size-buffers", "600")
+        .property("max-size-time", QUEUE_TIME_NS)
         .property("max-size-bytes", 0u32)
         .build()
         .map_err(|e| format!("make video queue: {e}"))?;
@@ -126,9 +137,11 @@ fn build_pipeline(hls_url: &str, audio_device: &str) -> Result<gst::Pipeline, St
     // audioresample → alsasink. The convert+resample pair is mandatory
     // (load-bearing format bridge — see CLAUDE.md "Shannon spela-local
     // audio chain are LOAD-BEARING").
+    // Same time-based cap as the video queue (10s) — paired buffering
+    // keeps A/V sync windows consistent under fetch jitter.
     let audio_queue = gst::ElementFactory::make("queue")
-        .property_from_str("max-size-buffers", "200")
-        .property("max-size-time", 0u64)
+        .property_from_str("max-size-buffers", "600")
+        .property("max-size-time", QUEUE_TIME_NS)
         .property("max-size-bytes", 0u32)
         .build()
         .map_err(|e| format!("make audio queue: {e}"))?;
