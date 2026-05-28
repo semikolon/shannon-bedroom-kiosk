@@ -383,6 +383,13 @@ struct EngineRes {
     /// two parallel spela-locals — Darwin spela serves one stream at a
     /// time; duplicate triggers would race the stream-replacement path.
     last_watch_action_at: Option<std::time::Instant>,
+    /// Phase 4 (2026-05-29) — timestamp of the last seek dispatch (POST
+    /// /seek → daemon forwards to spela-renderer Unix socket). Separate
+    /// debounce field because seek is the only field where rapid presses
+    /// are sometimes deliberate (4× DPad-Right in 1s to skip 2 minutes).
+    /// `SEEK_DEBOUNCE_MS` is 250 ms — blocks runaway autorepeat without
+    /// blocking deliberate tap rhythms.
+    last_seek_action_at: Option<std::time::Instant>,
     /// Timestamp of the last Music dispatch (POST /media → daemon HA
     /// `media_player.media_play_pause`). Separate debounce field from
     /// lights/watch — Music's HA round-trip is ~500 ms (audio backend
@@ -508,6 +515,7 @@ impl Default for EngineRes {
             submenu_cursor: 0,
             last_lights_action_at: None,
             last_watch_action_at: None,
+            last_seek_action_at: None,
             last_media_action_at: None,
             pending_watch: None,
         }
@@ -1154,6 +1162,71 @@ fn try_dispatch_watch(engine_res: &mut EngineRes, daemon_url: &DaemonUrl, title:
     }
     engine_res.last_watch_action_at = Some(now);
     spawn_daemon_watch_post(daemon_url.0.clone(), title.to_string());
+    true
+}
+
+/// Phase 4 (2026-05-29) — seek step size for DPad-LR in NowPlaying.
+/// 30s matches the spela web remote's scrub-step convention. A skip-30s
+/// is the smallest unit that meaningfully advances over an ad/title
+/// sequence; smaller (5-10s) feels finicky on a controller. Tap the
+/// DPad multiple times to skip further (debounce is 250 ms).
+const SEEK_STEP_SECS: u64 = 30;
+
+/// Phase 4 (2026-05-29) — seek-button debounce. ~250 ms blocks the
+/// "controller spammed" failure mode (one DPad press emits a single
+/// event in xpadneo on Shannon, but a stuck controller could repeat-fire
+/// at 100 Hz); doesn't block deliberate rapid taps (user can still hit
+/// DPad-Right 4× in 1s to skip 2 minutes). Same shape as MUSIC_DEBOUNCE.
+const SEEK_DEBOUNCE_MS: u64 = 250;
+
+/// Fire-and-forget POST to the daemon's `/seek` endpoint. JSON body shape:
+///   {"delta": N}      seek N seconds from current
+///   {"absolute": N}   seek to absolute N seconds
+/// The daemon translates to the spela-renderer Unix-socket protocol.
+/// Returns immediately after the POST; renderer's seek is non-blocking.
+fn spawn_daemon_seek_post(daemon_url: String, body: serde_json::Value) {
+    let body_log = body.to_string();
+    let result = std::thread::Builder::new()
+        .name(format!("daemon-post-seek-{}", body_log.replace(' ', "")))
+        .spawn(move || {
+            let url = format!("{}/seek", daemon_url.trim_end_matches('/'));
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("daemon-post-seek: client build failed: {e}");
+                    return;
+                }
+            };
+            match client.post(&url).json(&body).send() {
+                Ok(resp) => info!("daemon POST {} body={} → {}", url, body_log, resp.status()),
+                Err(e) => warn!("daemon POST {} body={} failed: {}", url, body_log, e),
+            }
+        });
+    if let Err(e) = result {
+        warn!("daemon-post-seek: thread spawn failed: {e}");
+    }
+}
+
+/// Debounced dispatch helper for seek. Same pattern as try_dispatch_watch.
+/// Returns true on send, false when throttled. Uses `last_seek_action_at`
+/// in `EngineRes` so seek + watch don't share a debounce window.
+fn try_dispatch_seek(
+    engine_res: &mut EngineRes,
+    daemon_url: &DaemonUrl,
+    body: serde_json::Value,
+) -> bool {
+    let now = std::time::Instant::now();
+    if let Some(last) = engine_res.last_seek_action_at {
+        if now.duration_since(last) < Duration::from_millis(SEEK_DEBOUNCE_MS) {
+            info!("seek {:?} throttled (rapid press)", body);
+            return false;
+        }
+    }
+    engine_res.last_seek_action_at = Some(now);
+    spawn_daemon_seek_post(daemon_url.0.clone(), body);
     true
 }
 
@@ -1807,7 +1880,7 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         NowPlayingElement::ScrubberFill,
     ));
     commands.spawn((
-        Text::new("B = back · Y = ALL OFF"),
+        Text::new("◀ -30s · ▶ +30s · X = restart · B = back"),
         TextFont {
             font: fonts.semibold.clone(),
             font_size: 28.0,
@@ -2135,6 +2208,29 @@ fn gamepad_event_system(
                 info!("Music NowPlaying: DPadRight = next");
                 try_dispatch_media(&mut engine_res, &daemon_url, MUSIC_DEFAULT_ENTITY, "next");
             }
+            // Phase 4 (2026-05-29) — NowPlaying transport controls. DPad-LR
+            // seek ±SEEK_STEP_SECS via spela-renderer's IPC socket
+            // (routed through kiosk-actions /seek). Active only when the
+            // playback session is live AND the kiosk has the display
+            // (cold-start window of the current Phase-7 architecture).
+            // After kiosk-overlay-on-playback ships, these stay-valid
+            // across the playback duration too.
+            GamepadButton::DPadLeft if matches!(engine_res.menu_level, MenuLevel::NowPlaying) => {
+                info!("NowPlaying: DPadLeft = seek -{}s", SEEK_STEP_SECS);
+                try_dispatch_seek(
+                    &mut engine_res,
+                    &daemon_url,
+                    serde_json::json!({ "delta": -(SEEK_STEP_SECS as i64) }),
+                );
+            }
+            GamepadButton::DPadRight if matches!(engine_res.menu_level, MenuLevel::NowPlaying) => {
+                info!("NowPlaying: DPadRight = seek +{}s", SEEK_STEP_SECS);
+                try_dispatch_seek(
+                    &mut engine_res,
+                    &daemon_url,
+                    serde_json::json!({ "delta": SEEK_STEP_SECS as i64 }),
+                );
+            }
             GamepadButton::South => match engine_res.menu_level {
                 MenuLevel::Root => {
                     let item = MENU[cursor_idx].item;
@@ -2335,23 +2431,38 @@ fn gamepad_event_system(
                 info!("ALL OFF (engine ForceOff)");
             }
             GamepadButton::West => {
-                // X = global "toggle ALL lights" (Fredrik 2026-05-21
-                // afternoon: *"make it ALL the lights"*). Fires
-                // regardless of which menu item is selected.
-                // X_ALL_TOGGLE_GROUPS = bedroom + office (hallway
-                // excluded — presence-driven, would race the
-                // automation). Atomic 300 ms debounce across all
-                // dispatched POSTs via try_dispatch_lights_multi.
-                // Crash-proof since 2026-05-21 (see ha.rs +
-                // spawn_daemon_lights_post for the barrage-crash
-                // history and child-lock principle).
-                info!("X: toggle ALL lights ({:?})", X_ALL_TOGGLE_GROUPS);
-                try_dispatch_lights_multi(
-                    &mut engine_res,
-                    &daemon_url,
-                    X_ALL_TOGGLE_GROUPS,
-                    "toggle",
-                );
+                // X is context-aware:
+                //  - NowPlaying (Phase 4, 2026-05-29): restart-from-start
+                //    (seek_absolute 0 via spela-renderer IPC). Active
+                //    only when a stream is playing.
+                //  - Anywhere else: global "toggle ALL lights" (Fredrik
+                //    2026-05-21 afternoon: *"make it ALL the lights"*).
+                //    X_ALL_TOGGLE_GROUPS = bedroom + office (hallway
+                //    excluded — presence-driven, would race the
+                //    automation). Atomic 300 ms debounce across all
+                //    dispatched POSTs via try_dispatch_lights_multi.
+                //    Crash-proof since 2026-05-21 (see ha.rs +
+                //    spawn_daemon_lights_post for the barrage-crash
+                //    history and child-lock principle).
+                match engine_res.menu_level {
+                    MenuLevel::NowPlaying => {
+                        info!("NowPlaying X: restart-from-start (seek_absolute 0)");
+                        try_dispatch_seek(
+                            &mut engine_res,
+                            &daemon_url,
+                            serde_json::json!({ "absolute": 0 }),
+                        );
+                    }
+                    _ => {
+                        info!("X: toggle ALL lights ({:?})", X_ALL_TOGGLE_GROUPS);
+                        try_dispatch_lights_multi(
+                            &mut engine_res,
+                            &daemon_url,
+                            X_ALL_TOGGLE_GROUPS,
+                            "toggle",
+                        );
+                    }
+                }
             }
             _ => {}
         }

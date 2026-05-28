@@ -17,3 +17,4 @@
 pub mod context;
 pub mod ha;
 pub mod ha_poll;
+pub mod spela_control_proto;

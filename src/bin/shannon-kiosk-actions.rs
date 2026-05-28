@@ -104,6 +104,7 @@ async fn main() {
         .route("/lights/:group/:action", post(lights_handler))
         .route("/media/:entity_key/:action", post(media_handler))
         .route("/watch", post(watch_handler))
+        .route("/seek", post(seek_handler))
         .with_state(state);
 
     // Bind: default to LAN-accessible 0.0.0.0:8080 so the remote media
@@ -632,6 +633,134 @@ async fn watch_handler(Json(req): Json<WatchReq>) -> impl IntoResponse {
             Json(json!({ "error": format!("thread spawn failed: {e}") })),
         ),
     }
+}
+
+/// POST /seek — Phase 4 (2026-05-29). Forwards a seek command to the
+/// spela-renderer control socket if a playback session is active. Two
+/// shapes accepted:
+///
+///   { "delta": -30 }    seek relative N seconds (negative = backward)
+///   { "absolute": 0 }   seek to absolute N seconds (e.g., 0 = restart)
+///
+/// Response shapes:
+///   200 {"sent":"seek_relative -30","reply":"ok pos=120"}
+///   503 {"error":"no active playback (socket not present)"}
+///   500 {"error":"<detail>"} on IO / parse failures
+///
+/// The socket path follows the same XDG_RUNTIME_DIR resolution as the
+/// renderer (`/run/cage-spela-local/spela-renderer.sock` when launched
+/// by spela-local, `/tmp/spela-renderer.sock` ad-hoc). Both candidates
+/// are tried in order; first existing wins.
+async fn seek_handler(Json(req): Json<SeekReq>) -> impl IntoResponse {
+    let command = match (req.delta, req.absolute) {
+        (Some(d), None) => format!("seek_relative {d}\n"),
+        (None, Some(a)) => format!("seek_absolute {a}\n"),
+        (Some(_), Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "specify either 'delta' or 'absolute', not both" })),
+            );
+        }
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'delta' or 'absolute'" })),
+            );
+        }
+    };
+    match send_renderer_command(&command).await {
+        Ok(reply) => (
+            StatusCode::OK,
+            Json(json!({
+                "sent": command.trim_end(),
+                "reply": reply.trim_end(),
+            })),
+        ),
+        Err(SeekError::SocketMissing) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "no active playback (socket not present)" })),
+        ),
+        Err(SeekError::Io(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("renderer ipc io: {e}") })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SeekReq {
+    /// Signed relative seconds (negative = backward). Mutually exclusive
+    /// with `absolute`.
+    delta: Option<i64>,
+    /// Absolute target position in seconds (≥0). Mutually exclusive with
+    /// `delta`. Set to 0 for restart-from-start.
+    absolute: Option<u64>,
+}
+
+enum SeekError {
+    /// Neither candidate socket path existed → no playback session.
+    SocketMissing,
+    /// Connect/read/write failed at the socket layer.
+    Io(String),
+}
+
+/// Resolve the renderer's IPC socket path. The cage-spela-local path is
+/// the live one when spela-local is the launcher (matches the renderer's
+/// XDG_RUNTIME_DIR=/run/cage-spela-local); the /tmp fallback is for
+/// ad-hoc operator runs.
+fn renderer_socket_candidates() -> [&'static str; 2] {
+    [
+        "/run/cage-spela-local/spela-renderer.sock",
+        "/tmp/spela-renderer.sock",
+    ]
+}
+
+async fn send_renderer_command(line: &str) -> Result<String, SeekError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use tokio::time::timeout;
+
+    let mut last_io_err: Option<String> = None;
+    let mut any_found = false;
+    for path in renderer_socket_candidates() {
+        if !std::path::Path::new(path).exists() {
+            continue;
+        }
+        any_found = true;
+        let connect = timeout(Duration::from_secs(2), UnixStream::connect(path)).await;
+        let mut stream = match connect {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                last_io_err = Some(format!("connect {path}: {e}"));
+                continue;
+            }
+            Err(_) => {
+                last_io_err = Some(format!("connect {path}: timeout"));
+                continue;
+            }
+        };
+        if let Err(e) = timeout(Duration::from_secs(2), stream.write_all(line.as_bytes())).await {
+            last_io_err = Some(format!("write timeout: {e}"));
+            continue;
+        }
+        let _ = stream.shutdown().await;
+        let mut buf = Vec::with_capacity(64);
+        match timeout(Duration::from_secs(3), stream.read_to_end(&mut buf)).await {
+            Ok(Ok(_)) => return Ok(String::from_utf8_lossy(&buf).to_string()),
+            Ok(Err(e)) => {
+                last_io_err = Some(format!("read: {e}"));
+            }
+            Err(_) => {
+                last_io_err = Some("read timeout".to_string());
+            }
+        }
+    }
+    if !any_found {
+        return Err(SeekError::SocketMissing);
+    }
+    Err(SeekError::Io(
+        last_io_err.unwrap_or_else(|| "unknown io".to_string()),
+    ))
 }
 
 #[derive(Debug, Deserialize)]

@@ -22,17 +22,42 @@
 //!   exits cleanly so the wrapper's `trap EXIT` restores the kiosk.
 //!
 //! Usage:
-//!     spela-renderer <HLS_URL>
+//!     spela-renderer <HLS_URL> [audio_device]
 //!
 //! Returns exit code 0 on clean EOS, non-zero on pipeline error.
+//!
+//! Control IPC (Phase 4, 2026-05-29) — Unix socket at
+//! `$XDG_RUNTIME_DIR/spela-renderer.sock` (falls back to
+//! `/tmp/spela-renderer.sock` when XDG_RUNTIME_DIR is unset, e.g. ad-hoc
+//! manual runs). Newline-delimited text protocol:
+//!
+//!   seek_relative <signed-seconds>\n  → seek N seconds from current
+//!   seek_absolute <seconds>\n         → seek to absolute position
+//!   quit\n                            → graceful EOS + shutdown
+//!
+//! Each command receives a single-line response on the same connection:
+//!   ok pos=<secs>\n                   → seek/quit accepted
+//!   err <message>\n                   → bad parse, no pipeline, etc.
+//!
+//! The listener thread holds an Arc<Mutex<Pipeline>>; commands translate
+//! to `Pipeline::seek_simple` with FLUSH + KEY_UNIT flags (KEY_UNIT keeps
+//! seek points on H.264 keyframes — Mali rkvdec stateless decoder doesn't
+//! support arbitrary-frame seek; FLUSH discards in-flight buffers).
+//! Socket is removed on pipeline teardown so the next session starts fresh.
 
 use std::env;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
+
+use shannon_kiosk::spela_control_proto::{parse_command, Command};
 
 /// Build the cage+waylandsink HW pipeline. Mirrors the empirically-
 /// validated `spela-local` v4 chain:
@@ -216,14 +241,185 @@ fn build_pipeline(hls_url: &str, audio_device: &str) -> Result<gst::Pipeline, St
     Ok(pipeline)
 }
 
+/// Phase 4 — resolve the control socket path. Uses XDG_RUNTIME_DIR when
+/// available (the daemon-launched case via cage RuntimeDirectory), falls
+/// back to /tmp for ad-hoc manual runs.
+fn control_socket_path() -> PathBuf {
+    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("spela-renderer.sock");
+        }
+    }
+    PathBuf::from("/tmp/spela-renderer.sock")
+}
+
+/// Apply a parsed command to the live pipeline. Returns the resulting
+/// position in seconds for the success response (best-effort — query
+/// failure returns 0). Quit triggers `quit_signal` (set to true) which
+/// the bus loop polls to break out cleanly.
+fn apply_command(
+    cmd: Command,
+    pipeline: &gst::Pipeline,
+    quit_signal: &Arc<Mutex<bool>>,
+) -> Result<u64, String> {
+    let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT;
+    match cmd {
+        Command::SeekRelative(delta) => {
+            let current_ns = pipeline
+                .query_position::<gst::ClockTime>()
+                .ok_or_else(|| "query_position failed".to_string())?
+                .nseconds() as i128;
+            let delta_ns = (delta as i128) * 1_000_000_000;
+            let mut target_ns = current_ns + delta_ns;
+            if target_ns < 0 {
+                target_ns = 0;
+            }
+            // Clamp to duration if known (avoid seeking past EOS).
+            if let Some(dur) = pipeline.query_duration::<gst::ClockTime>() {
+                let dur_ns = dur.nseconds() as i128;
+                if target_ns > dur_ns {
+                    target_ns = dur_ns;
+                }
+            }
+            let target = gst::ClockTime::from_nseconds(target_ns as u64);
+            pipeline
+                .seek_simple(flags, target)
+                .map_err(|e| format!("seek_simple: {e}"))?;
+            Ok(target.seconds())
+        }
+        Command::SeekAbsolute(secs) => {
+            let target = gst::ClockTime::from_seconds(secs);
+            pipeline
+                .seek_simple(flags, target)
+                .map_err(|e| format!("seek_simple: {e}"))?;
+            Ok(secs)
+        }
+        Command::Quit => {
+            if let Ok(mut q) = quit_signal.lock() {
+                *q = true;
+            }
+            let pos = pipeline
+                .query_position::<gst::ClockTime>()
+                .map(|t| t.seconds())
+                .unwrap_or(0);
+            Ok(pos)
+        }
+    }
+}
+
+/// Spawn the control-socket listener thread. Owns the socket file
+/// lifecycle: creates on start, removes on drop / EOS via best-effort
+/// remove_file. Each accepted connection is line-delimited; the thread
+/// reads one command, applies it, writes the response, closes the
+/// connection. Errors are isolated per-connection so a malformed client
+/// doesn't take down the listener.
+fn spawn_control_listener(
+    pipeline: Arc<Mutex<gst::Pipeline>>,
+    quit_signal: Arc<Mutex<bool>>,
+    socket_path: PathBuf,
+) -> Result<(), String> {
+    // Remove any stale socket from a previous crash before binding.
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|e| format!("bind {}: {}", socket_path.display(), e))?;
+    // Non-blocking accept lets us drop the listener cleanly on quit;
+    // a small sleep keeps the loop from busy-spinning.
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("set_nonblocking: {e}"))?;
+    eprintln!(
+        "[spela-renderer] control socket listening at {}",
+        socket_path.display()
+    );
+    let socket_for_cleanup = socket_path.clone();
+    thread::Builder::new()
+        .name("spela-renderer-control".to_string())
+        .spawn(move || {
+            loop {
+                // Check the quit flag — when the bus loop sets it (via a
+                // quit command OR EOS/error), we tear down.
+                if quit_signal.lock().map(|q| *q).unwrap_or(false) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let pipeline = pipeline.clone();
+                        let quit_signal = quit_signal.clone();
+                        // Handle each connection on its own thread so a
+                        // slow/hung client can't block the listener.
+                        let _ = thread::Builder::new()
+                            .name("spela-renderer-conn".to_string())
+                            .spawn(move || {
+                                handle_connection(stream, pipeline, quit_signal);
+                            });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => {
+                        eprintln!("[spela-renderer] accept error: {e}");
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
+            // Best-effort cleanup. Renderer EXIT trap handles the
+            // shannon-display.service restart; we just remove the socket.
+            let _ = std::fs::remove_file(&socket_for_cleanup);
+            eprintln!("[spela-renderer] control listener exiting");
+        })
+        .map_err(|e| format!("spawn control listener: {e}"))?;
+    Ok(())
+}
+
+/// Handle a single connection: read ONE line, apply, respond.
+fn handle_connection(
+    stream: UnixStream,
+    pipeline: Arc<Mutex<gst::Pipeline>>,
+    quit_signal: Arc<Mutex<bool>>,
+) {
+    // Modest read timeout — a misbehaving client shouldn't hang us.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    let response = match reader.read_line(&mut line) {
+        Ok(_) => match parse_command(&line) {
+            Ok(Some(cmd)) => match pipeline.lock() {
+                Ok(p) => match apply_command(cmd, &p, &quit_signal) {
+                    Ok(pos) => format!("ok pos={pos}\n"),
+                    Err(e) => format!("err {e}\n"),
+                },
+                Err(e) => format!("err pipeline lock poisoned: {e}\n"),
+            },
+            Ok(None) => "err empty command\n".to_string(),
+            Err(e) => format!("err {e}\n"),
+        },
+        Err(e) => format!("err read_line: {e}\n"),
+    };
+    let mut writer = stream;
+    let _ = writer.write_all(response.as_bytes());
+}
+
 /// Walk the GStreamer bus until EOS or a fatal Error. Returns Ok(()) on
 /// clean EOS; Err(msg) on pipeline error. State-changed messages from
 /// non-pipeline elements are ignored.
-fn run_until_eos(pipeline: &gst::Pipeline) -> Result<(), String> {
+///
+/// Phase 4: also polls the quit_signal each tick — when a `quit` IPC
+/// command arrives, the listener sets the flag and we issue EOS so the
+/// pipeline tears down cleanly.
+fn run_until_eos(pipeline: &gst::Pipeline, quit_signal: &Arc<Mutex<bool>>) -> Result<(), String> {
     let bus = pipeline
         .bus()
         .ok_or_else(|| "pipeline has no bus".to_string())?;
     loop {
+        // Poll the quit flag — set by the IPC `quit` command. We send
+        // EOS through the bus so the pipeline flushes cleanly; the next
+        // bus tick will see the EOS message and return Ok.
+        if quit_signal.lock().map(|q| *q).unwrap_or(false) {
+            // Idempotent — sending EOS to an already-EOS pipeline is
+            // harmless. send_event blocks briefly; that's fine here.
+            pipeline.send_event(gst::event::Eos::new());
+        }
         let msg = bus.timed_pop(Some(gst::ClockTime::from_seconds(1)));
         let m = match msg {
             Some(m) => m,
@@ -290,14 +486,35 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let result = run_until_eos(&pipeline);
+    // Phase 4 — spawn the control socket listener. Wrap the pipeline in
+    // Arc<Mutex<>> so the listener can apply seek commands without
+    // racing the main bus loop. Failure to bind is non-fatal: log it
+    // and proceed without IPC (playback still works).
+    let pipeline_arc = Arc::new(Mutex::new(pipeline.clone()));
+    let quit_signal = Arc::new(Mutex::new(false));
+    let socket_path = control_socket_path();
+    if let Err(e) = spawn_control_listener(
+        pipeline_arc.clone(),
+        quit_signal.clone(),
+        socket_path.clone(),
+    ) {
+        eprintln!("[spela-renderer] control listener disabled: {e}");
+    }
+
+    let result = run_until_eos(&pipeline, &quit_signal);
 
     // Always tear down cleanly so the wrapper's trap EXIT doesn't see
     // a hanging pipeline holding the wayland socket / ALSA device.
     eprintln!("[spela-renderer] tearing down pipeline");
+    // Signal the control listener to exit + clean up its socket.
+    if let Ok(mut q) = quit_signal.lock() {
+        *q = true;
+    }
     let _ = pipeline.set_state(gst::State::Null);
     // brief sleep to flush async state changes
     std::thread::sleep(Duration::from_millis(200));
+    // Best-effort socket cleanup (the listener also tries; both safe).
+    let _ = std::fs::remove_file(&socket_path);
 
     match result {
         Ok(()) => {
@@ -310,3 +527,6 @@ fn main() -> ExitCode {
         }
     }
 }
+
+// Tests for the parser live in `src/spela_control_proto.rs` so they
+// can run on any host (no gstreamer system dep required).
