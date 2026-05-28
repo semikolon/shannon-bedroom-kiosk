@@ -75,6 +75,16 @@ mod watch_ui;
 const WATCH_GRID_SLOTS: usize = 10;
 const WATCH_GRID_COLS: usize = 5;
 
+/// Phase 4 — scrubber bar geometry. Track width matches the Position
+/// row's horizontal extent (1240 px). Track height kept compact (16 px)
+/// so the bar reads as a progress indicator, not a competing focus
+/// element. Track color is a low-contrast translucent dark to recede;
+/// fill uses AMBER_ACCENT (same hue as selected menu items) so progress
+/// reads as the only active surface on the bar.
+const SCRUBBER_TRACK_WIDTH_PX: f32 = 1240.0;
+const SCRUBBER_HEIGHT_PX: f32 = 16.0;
+const SCRUBBER_TRACK_COLOR: Color = Color::srgba(0.10, 0.12, 0.10, 0.85);
+
 // ─── Embedded font assets (commit-time bundled into the binary) ──────
 const SHARP_SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/SharpSans-Semibold.otf");
 const SHARP_SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/SharpSans-Bold.otf");
@@ -549,12 +559,24 @@ struct LightsSubmenuLabel {
 #[derive(Component)]
 struct WatchPendingOverlay;
 
-/// Now-Playing view (Phase-7 Phase 3, 2026-05-28) — full-screen surface
+/// Now-Playing view (Phase-7 Phase 3+4, 2026-05-28) — full-screen surface
 /// showing the currently-playing stream's title + state + position.
 /// Visibility is flipped by `now_playing_render_system` based on
-/// `EngineRes.menu_level == MenuLevel::NowPlaying`. The four marker
-/// variants identify which text role each child entity owns; one query
-/// updates all in a single pass.
+/// `EngineRes.menu_level == MenuLevel::NowPlaying`. The marker variants
+/// identify which child entity owns each role; one query updates all in
+/// a single pass.
+///
+/// Phase 4 (2026-05-28) adds ScrubberTrack + ScrubberFill — a visual
+/// progress bar between Position and Hint. ScrubberFill's width is
+/// updated each tick to `track_width * (position_secs / duration_secs)`.
+/// Input bindings (DPad-LR seek, X restart) are NOT wired in v1 because
+/// the current Phase-7 architecture stops shannon-display.service during
+/// spela-local playback (kiosk dies for the playback window), AND spela's
+/// HTTP `/seek` is Chromecast-only (Shannon's GStreamer pipeline has no
+/// IPC surface). Both gaps will close together: either kiosk-overlay-on-
+/// playback OR spela-local IPC unlocks both seek bindings and the
+/// scrubber-as-control surface. Until then the bar is informational —
+/// useful during the 5-30s cold-start window where NowPlaying IS visible.
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 enum NowPlayingElement {
     /// Translucent dark backing card covering the whole content area.
@@ -566,6 +588,14 @@ enum NowPlayingElement {
     Status,
     /// Position row: "M:SS / H:MM:SS" — elapsed / total.
     Position,
+    /// Phase 4 — static dark track for the scrubber bar (full-width).
+    /// No text — visibility + position only.
+    ScrubberTrack,
+    /// Phase 4 — amber fill on top of the track. `Node.width` is updated
+    /// each tick by `now_playing_render_system` to reflect the playback
+    /// position as a fraction of duration. Width=0 when no position or
+    /// duration is known.
+    ScrubberFill,
     /// Hint row at bottom: "B = back · Y = ALL OFF".
     Hint,
 }
@@ -1744,6 +1774,37 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         },
         Visibility::Hidden,
         NowPlayingElement::Position,
+    ));
+    // Phase 4 (2026-05-28): scrubber bar — static track + dynamic fill.
+    // Track at y=720, width 1240 (matches Position row's x-extent). Fill
+    // is a child Node spawned on top with width updated each tick. The
+    // 1240 px constant lives in both the spawn here and the render system
+    // (`SCRUBBER_TRACK_WIDTH_PX`) — keep them in sync.
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(720.0),
+            left: Val::Px(620.0),
+            width: Val::Px(SCRUBBER_TRACK_WIDTH_PX),
+            height: Val::Px(SCRUBBER_HEIGHT_PX),
+            ..default()
+        },
+        BackgroundColor(SCRUBBER_TRACK_COLOR),
+        Visibility::Hidden,
+        NowPlayingElement::ScrubberTrack,
+    ));
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(720.0),
+            left: Val::Px(620.0),
+            width: Val::Px(0.0), // updated each tick from position/duration
+            height: Val::Px(SCRUBBER_HEIGHT_PX),
+            ..default()
+        },
+        BackgroundColor(AMBER_ACCENT),
+        Visibility::Hidden,
+        NowPlayingElement::ScrubberFill,
     ));
     commands.spawn((
         Text::new("B = back · Y = ALL OFF"),
@@ -4060,7 +4121,12 @@ fn music_now_playing_render_system(
 fn now_playing_render_system(
     engine_res: Res<EngineRes>,
     snap: Res<now_playing::NowPlayingSnapshotRes>,
-    mut q: Query<(&mut Visibility, Option<&mut Text>, &NowPlayingElement)>,
+    mut q: Query<(
+        &mut Visibility,
+        Option<&mut Text>,
+        Option<&mut Node>,
+        &NowPlayingElement,
+    )>,
 ) {
     let visible = matches!(engine_res.menu_level, MenuLevel::NowPlaying);
     // Read the snapshot once, build the rendered fields, then iterate
@@ -4068,7 +4134,13 @@ fn now_playing_render_system(
     // resource access. Position is interpolated forward by
     // `(now - fetched_at)` when the stream is actively streaming, so
     // the counter ticks every frame instead of jumping every poll.
-    let (title_text, status_text, position_text) = if visible {
+    //
+    // Phase 4: also compute scrubber fill width as `track_width *
+    // (elapsed / duration)` clamped to [0, track_width]. When duration
+    // is unknown (live HLS or pre-probe), fill stays at 0 — the bar
+    // visually communicates "we don't know how far through" by being
+    // empty.
+    let (title_text, status_text, position_text, scrubber_fill_px) = if visible {
         let s = snap.0.lock().unwrap();
         let raw_title = s.title.as_deref().unwrap_or("(no title)");
         let title = now_playing::truncate_title(raw_title, 64);
@@ -4094,12 +4166,14 @@ fn now_playing_render_system(
             ),
             _ => now_playing::format_hms(elapsed),
         };
-        (title, status_lbl, position)
+        let fill_px =
+            now_playing::scrubber_fill_px(elapsed, s.duration_secs, SCRUBBER_TRACK_WIDTH_PX);
+        (title, status_lbl, position, fill_px)
     } else {
-        (String::new(), String::new(), String::new())
+        (String::new(), String::new(), String::new(), 0.0)
     };
 
-    for (mut vis, text, element) in q.iter_mut() {
+    for (mut vis, text, node, element) in q.iter_mut() {
         *vis = if visible {
             Visibility::Inherited
         } else {
@@ -4114,10 +4188,17 @@ fn now_playing_render_system(
                 NowPlayingElement::Title => &title_text,
                 NowPlayingElement::Status => &status_text,
                 NowPlayingElement::Position => &position_text,
+                NowPlayingElement::ScrubberTrack | NowPlayingElement::ScrubberFill => continue,
                 NowPlayingElement::Hint => continue, // static text
             };
             if t.0 != *new_value {
                 t.0 = new_value.clone();
+            }
+        }
+        // Phase 4: dynamically resize the scrubber fill node.
+        if let NowPlayingElement::ScrubberFill = element {
+            if let Some(mut n) = node {
+                n.width = Val::Px(scrubber_fill_px);
             }
         }
     }

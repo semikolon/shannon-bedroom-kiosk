@@ -201,6 +201,24 @@ pub fn format_hms(seconds: f64) -> String {
     }
 }
 
+/// Phase 4 — compute the scrubber fill width in pixels given elapsed
+/// seconds, total duration, and the track's full pixel width. Returns
+/// 0.0 when duration is missing/zero/NaN/negative (we don't know the
+/// total length, so the bar is empty). Clamps to [0, track_width_px]
+/// for the well-formed case so frame-level interpolation past the end
+/// of duration (a poll-cycle race) doesn't overflow the bar.
+pub fn scrubber_fill_px(elapsed: f64, duration: Option<f64>, track_width_px: f32) -> f32 {
+    let d = match duration {
+        Some(d) if d.is_finite() && d > 0.0 => d,
+        _ => return 0.0,
+    };
+    if !elapsed.is_finite() {
+        return 0.0;
+    }
+    let frac = (elapsed / d).clamp(0.0, 1.0);
+    (frac as f32) * track_width_px
+}
+
 /// User-facing label for the spela `status` field. Falls back to the raw
 /// string for unknown values so future spela states surface meaningfully
 /// instead of being silently hidden.
@@ -353,6 +371,53 @@ mod tests {
         let (title, dur) = extract_current(&v);
         assert_eq!(title.as_deref(), Some("Foo"));
         assert_eq!(dur, None);
+    }
+
+    #[test]
+    fn scrubber_fill_px_no_duration_is_zero() {
+        assert_eq!(scrubber_fill_px(120.0, None, 1240.0), 0.0);
+    }
+
+    #[test]
+    fn scrubber_fill_px_zero_duration_is_zero() {
+        assert_eq!(scrubber_fill_px(120.0, Some(0.0), 1240.0), 0.0);
+    }
+
+    #[test]
+    fn scrubber_fill_px_negative_duration_is_zero() {
+        assert_eq!(scrubber_fill_px(120.0, Some(-100.0), 1240.0), 0.0);
+    }
+
+    #[test]
+    fn scrubber_fill_px_nan_or_inf_is_zero() {
+        assert_eq!(scrubber_fill_px(f64::NAN, Some(100.0), 1240.0), 0.0);
+        assert_eq!(scrubber_fill_px(120.0, Some(f64::NAN), 1240.0), 0.0);
+        assert_eq!(scrubber_fill_px(120.0, Some(f64::INFINITY), 1240.0), 0.0);
+    }
+
+    #[test]
+    fn scrubber_fill_px_half_is_half_width() {
+        let px = scrubber_fill_px(60.0, Some(120.0), 1000.0);
+        assert!((px - 500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn scrubber_fill_px_full_is_full_width() {
+        let px = scrubber_fill_px(120.0, Some(120.0), 1000.0);
+        assert!((px - 1000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn scrubber_fill_px_overshoot_clamps_to_full_width() {
+        // Position interpolation past EOD (poll-cycle race) — fill
+        // should not overflow the track. Clamped to track_width.
+        let px = scrubber_fill_px(150.0, Some(120.0), 1000.0);
+        assert!((px - 1000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn scrubber_fill_px_at_start_is_zero() {
+        assert_eq!(scrubber_fill_px(0.0, Some(120.0), 1000.0), 0.0);
     }
 
     #[test]
