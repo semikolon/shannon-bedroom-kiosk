@@ -57,10 +57,15 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    let music_entity = env_or("HA_MUSIC_PLAYER_ENTITY", "media_player.music");
     let ha = HaConfig {
         base_url: env_or("HA_BASE_URL", "http://localhost:8123"),
         token: std::env::var("HA_TOKEN").unwrap_or_default(),
         tv_plug_entity: env_or("HA_TV_PLUG_ENTITY", "switch.bedroom_tv_plug"),
+        media_entities: vec![
+            ("default".to_string(), music_entity.clone()),
+            ("music".to_string(), music_entity),
+        ],
         ..HaConfig::default()
     };
     let state = Arc::new(AppState {
@@ -71,7 +76,7 @@ async fn main() {
             .build()
             .expect("reqwest client"),
         ha_poll: Mutex::new(HaPollState::default()),
-        media_player_entity: env_or("HA_MEDIA_PLAYER_ENTITY", "media_player.fredriks_tv"),
+        media_player_entity: env_or("HA_MEDIA_PLAYER_ENTITY", "media_player.tv"),
         occupancy_entity: env_or("HA_OCCUPANCY_ENTITY", ""),
         poll_interval: parse_secs("HA_POLL_INTERVAL_SECS", 30),
     });
@@ -95,13 +100,13 @@ async fn main() {
         .route("/watch", post(watch_handler))
         .with_state(state);
 
-    // Bind: default to LAN-accessible 0.0.0.0:8080 so Darwin spela can
-    // POST /watch when target=shannon is picked in the web remote. The
+    // Bind: default to LAN-accessible 0.0.0.0:8080 so the remote media
+    // controller can POST /watch when target=shannon is picked. The
     // /watch handler's title validation (length ≤200, no control chars)
     // + Command::arg-not-shell-exec are the security posture. Tighten
-    // via env SHANNON_KIOSK_ACTIONS_BIND if needed (e.g. to
-    // "192.168.4.30:8080" — Shannon's LAN-reserved IP — or back to
-    // "127.0.0.1:8080" if LAN access is undesirable).
+    // via env SHANNON_KIOSK_ACTIONS_BIND if needed (e.g. to a specific
+    // LAN-reserved IP, or back to "127.0.0.1:8080" if LAN access is
+    // undesirable).
     let bind_addr = env_or("SHANNON_KIOSK_ACTIONS_BIND", "0.0.0.0:8080");
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -701,7 +706,7 @@ mod tests {
     #[test]
     fn parse_media_player_full_payload() {
         let v = json!({
-            "entity_id": "media_player.fredriks_tv",
+            "entity_id": "media_player.tv",
             "state": "playing",
             "attributes": {
                 "media_title": "Show S01E03",

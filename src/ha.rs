@@ -68,11 +68,11 @@ pub struct HaConfig {
     /// `docs/personal_iot.md` § "Auxiliary (NOT a lamp)".
     pub light_groups: Vec<(String, String)>,
     /// Friendly kiosk media-entity name → HA `media_player.*` entity.
-    /// `"default"` is the Music tile's target (toggle play/pause); today
-    /// that's `media_player.fredrik` (spotifyd Spotify-Connect on
-    /// Shannon, advertised via mDNS). Future per-zone routing extends
-    /// the table (vardagsrum / atelier / etc.) without changing the
-    /// resolver shape.
+    /// `"default"` is the Music tile's target (toggle play/pause); the
+    /// HA entity ID is operator-configured via `HA_MUSIC_PLAYER_ENTITY`
+    /// (typically a spotifyd Spotify-Connect endpoint advertised via
+    /// mDNS). Future per-zone routing extends the table (vardagsrum /
+    /// atelier / etc.) without changing the resolver shape.
     pub media_entities: Vec<(String, String)>,
 }
 
@@ -87,9 +87,13 @@ impl Default for HaConfig {
                 ("office".to_string(), "group.office_lights".to_string()),
                 ("hallway".to_string(), "group.hallway_indicator".to_string()),
             ],
+            // Generic placeholder; real entity is operator-configured per
+            // host via `HA_MUSIC_PLAYER_ENTITY` env (handled in the daemon
+            // binary's HaConfig construction). Tests + tooling that use
+            // `HaConfig::default()` get the placeholder.
             media_entities: vec![
-                ("default".to_string(), "media_player.fredrik".to_string()),
-                ("fredrik".to_string(), "media_player.fredrik".to_string()),
+                ("default".to_string(), "media_player.music".to_string()),
+                ("music".to_string(), "media_player.music".to_string()),
             ],
         }
     }
@@ -293,10 +297,10 @@ mod tests {
         let call = plan_media("default", "play_pause", &c).expect("default key resolves");
         assert_eq!(call.domain, "media_player");
         assert_eq!(call.service, "media_play_pause");
-        assert_eq!(call.entity_id, "media_player.fredrik");
-        // Aliases
+        assert_eq!(call.entity_id, "media_player.music");
+        // Aliases (case-insensitive)
         assert_eq!(
-            plan_media("Fredrik", "toggle", &c).unwrap().service,
+            plan_media("Music", "toggle", &c).unwrap().service,
             "media_play_pause"
         );
     }

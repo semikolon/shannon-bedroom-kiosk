@@ -1061,9 +1061,10 @@ fn try_dispatch_watch(engine_res: &mut EngineRes, daemon_url: &DaemonUrl, title:
 const MUSIC_DEBOUNCE_MS: u64 = 500;
 
 /// Default Music entity key — kiosk identifier resolved by the daemon
-/// against `HaConfig::media_entities`. `"default"` maps to
-/// `media_player.fredrik` (spotifyd Spotify-Connect on Shannon).
-/// Future per-zone routing extends the entity table on the daemon side
+/// against `HaConfig::media_entities`. `"default"` maps to whatever the
+/// daemon's `HA_MUSIC_PLAYER_ENTITY` env var configures (typically a
+/// spotifyd Spotify-Connect endpoint advertised via mDNS). Future
+/// per-zone routing extends the entity table on the daemon side
 /// without touching the kiosk.
 const MUSIC_DEFAULT_ENTITY: &str = "default";
 

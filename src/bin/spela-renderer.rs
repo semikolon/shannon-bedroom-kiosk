@@ -64,9 +64,9 @@ fn build_pipeline(hls_url: &str, audio_device: &str) -> Result<gst::Pipeline, St
         .property("location", hls_url)
         .build()
         .map_err(|e| format!("make souphttpsrc: {e}"))?;
-    let hlsdemux = gst::ElementFactory::make("hlsdemux")
-        .build()
-        .map_err(|e| format!("make hlsdemux (legacy needed; hlsdemux2 won't work in a plain bin): {e}"))?;
+    let hlsdemux = gst::ElementFactory::make("hlsdemux").build().map_err(|e| {
+        format!("make hlsdemux (legacy needed; hlsdemux2 won't work in a plain bin): {e}")
+    })?;
     let tsdemux = gst::ElementFactory::make("tsdemux")
         .build()
         .map_err(|e| format!("make tsdemux: {e}"))?;
@@ -232,7 +232,10 @@ fn run_until_eos(pipeline: &gst::Pipeline) -> Result<(), String> {
         match m.view() {
             gst::MessageView::Eos(_) => return Ok(()),
             gst::MessageView::Error(err) => {
-                let src = err.src().map(|s| s.path_string().to_string()).unwrap_or_default();
+                let src = err
+                    .src()
+                    .map(|s| s.path_string().to_string())
+                    .unwrap_or_default();
                 return Err(format!(
                     "pipeline error from {src}: {} (debug: {:?})",
                     err.error(),
@@ -240,7 +243,11 @@ fn run_until_eos(pipeline: &gst::Pipeline) -> Result<(), String> {
                 ));
             }
             gst::MessageView::Warning(w) => {
-                eprintln!("[spela-renderer] warning: {} (debug: {:?})", w.error(), w.debug());
+                eprintln!(
+                    "[spela-renderer] warning: {} (debug: {:?})",
+                    w.error(),
+                    w.debug()
+                );
             }
             _ => {}
         }

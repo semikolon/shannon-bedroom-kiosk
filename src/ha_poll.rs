@@ -1,7 +1,7 @@
 //! Home Assistant **state polling** (Slice 3d) — pure parsing, std-only.
 //!
 //! The kiosk needs real-time HA state for:
-//!   - `media_player.fredriks_tv` (playing / paused / idle / off) — feeds
+//!   - `media_player.tv` (playing / paused / idle / off) — feeds
 //!     `Media::Video` into the engine + drives the ribbon-offer for
 //!     resume-last-watched (Slice 3e).
 //!   - `binary_sensor.bedroom_occupancy` (presence-service via HA) —
@@ -16,7 +16,7 @@
 //! HA REST shape (from `/api/states/<entity_id>`):
 //!   ```json
 //!   {
-//!     "entity_id": "media_player.fredriks_tv",
+//!     "entity_id": "media_player.tv",
 //!     "state": "playing",
 //!     "attributes": {
 //!       "media_title": "Some Episode",
