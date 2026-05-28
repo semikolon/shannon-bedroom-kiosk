@@ -64,6 +64,7 @@ const OAT_DIM: Color = Color::srgb(0.55, 0.56, 0.49); // secondary text
 const OAT_FAINT: Color = Color::srgb(0.38, 0.39, 0.36); // tertiary text
 const AMBER_ACCENT: Color = Color::srgb(0.94, 0.71, 0.18); // selected + [A]
 
+mod now_playing;
 mod watch_ui;
 
 // ─── Embedded font assets (commit-time bundled into the binary) ──────
@@ -214,6 +215,12 @@ enum MenuLevel {
     /// is DYNAMIC (from `watch_ui::LibrarySnapshotRes`) so submenu_for
     /// returns &[] — render path special-cases this variant.
     WatchSubmenu,
+    /// Now-Playing view (Phase-7 rank-1 Phase 3, 2026-05-28): full-screen
+    /// surface showing title + state + elapsed/duration. Entered after a
+    /// Watch dispatch; B returns to WatchSubmenu (cursor restored).
+    /// Content is DYNAMIC (from `now_playing::NowPlayingSnapshotRes`) and
+    /// has no submenu list — render path special-cases this variant.
+    NowPlaying,
 }
 
 struct SubmenuTile {
@@ -270,6 +277,10 @@ fn submenu_for(level: MenuLevel) -> &'static [SubmenuTile] {
         // menu_render_system + gamepad_event_system special-case this variant
         // to read the library snapshot instead of this static slice.
         MenuLevel::WatchSubmenu => &[],
+        // NowPlaying is a single-item full-screen view (no list); the
+        // gamepad_event_system uses an n=1 short-circuit and the render
+        // path uses now_playing::NowPlayingSnapshotRes.
+        MenuLevel::NowPlaying => &[],
     }
 }
 
@@ -502,6 +513,27 @@ struct LightsSubmenuLabel {
 #[derive(Component)]
 struct WatchPendingOverlay;
 
+/// Now-Playing view (Phase-7 Phase 3, 2026-05-28) — full-screen surface
+/// showing the currently-playing stream's title + state + position.
+/// Visibility is flipped by `now_playing_render_system` based on
+/// `EngineRes.menu_level == MenuLevel::NowPlaying`. The four marker
+/// variants identify which text role each child entity owns; one query
+/// updates all in a single pass.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum NowPlayingElement {
+    /// Translucent dark backing card covering the whole content area.
+    /// No text — visibility-only.
+    Backing,
+    /// Big title row (truncated via `now_playing::truncate_title`).
+    Title,
+    /// State row: "▶ STREAMING" / "STARTING…" / "■ STOPPED" / etc.
+    Status,
+    /// Position row: "M:SS / H:MM:SS" — elapsed / total.
+    Position,
+    /// Hint row at bottom: "B = back · Y = ALL OFF".
+    Hint,
+}
+
 #[derive(Component)]
 struct StateBadge;
 
@@ -694,6 +726,21 @@ fn main() {
                 .unwrap_or(120);
             watch_ui::spawn_library_poller(base_url, Duration::from_secs(interval_secs))
         })
+        .insert_resource({
+            // Now-Playing poller (Phase-7 Phase 3, 2026-05-28): polls
+            // spela's /status + /api/position every 2s while the kiosk
+            // is running. Cheap calls (no HA round-trip) so the cadence
+            // can be aggressive without budget pressure. Override via
+            // SPELA_NOW_PLAYING_POLL_INTERVAL_SECS for testing / slow
+            // links. Uses the same base URL as the library poller above.
+            let base_url = std::env::var("SPELA_BASE_URL")
+                .unwrap_or_else(|_| "http://darwin.home:7890".to_string());
+            let interval_secs = std::env::var("SPELA_NOW_PLAYING_POLL_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(2);
+            now_playing::spawn_now_playing_poller(base_url, Duration::from_secs(interval_secs))
+        })
         .add_plugins(
             DefaultPlugins
                 .set(RenderPlugin {
@@ -749,6 +796,7 @@ fn main() {
                 blackout_render_system,
                 state_badge_system,
                 pending_watch_overlay_system,
+                now_playing_render_system,
             ),
         )
         .run();
@@ -1525,6 +1573,99 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         Visibility::Hidden,
         WatchPendingOverlay,
     ));
+
+    // ─── Now-Playing view (Phase-7 Phase 3, 2026-05-28) ────────────────
+    // Full-screen surface spawned hidden. The render system flips
+    // visibility on/off when menu_level transitions to/from NowPlaying,
+    // and updates the title/status/position text from the snapshot.
+    // Backing card sits behind the text rows. Sized to leave the sidebar
+    // visible (per Watch UI Legibility Pass consistency) — covers the
+    // right ~2/3 of the canvas only, like the preview pane does.
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(0.0),
+            left: Val::Px(540.0), // Same x-offset as the preview pane.
+            width: Val::Px(1380.0),
+            height: Val::Px(1080.0),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.04, 0.05, 0.04, 0.92)),
+        Visibility::Hidden,
+        NowPlayingElement::Backing,
+    ));
+    commands.spawn((
+        Text::new("(no title)"),
+        TextFont {
+            font: fonts.bold.clone(),
+            font_size: 64.0,
+            ..default()
+        },
+        TextColor(OAT_MILK),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(280.0),
+            left: Val::Px(620.0),
+            width: Val::Px(1240.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        NowPlayingElement::Title,
+    ));
+    commands.spawn((
+        Text::new("STARTING…"),
+        TextFont {
+            font: fonts.semibold.clone(),
+            font_size: 56.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.65, 0.92, 0.55)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(440.0),
+            left: Val::Px(620.0),
+            width: Val::Px(1240.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        NowPlayingElement::Status,
+    ));
+    commands.spawn((
+        Text::new("0:00"),
+        TextFont {
+            font: fonts.semibold.clone(),
+            font_size: 84.0,
+            ..default()
+        },
+        TextColor(OAT_MILK),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(560.0),
+            left: Val::Px(620.0),
+            width: Val::Px(1240.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        NowPlayingElement::Position,
+    ));
+    commands.spawn((
+        Text::new("B = back · Y = ALL OFF"),
+        TextFont {
+            font: fonts.semibold.clone(),
+            font_size: 28.0,
+            ..default()
+        },
+        TextColor(OAT_FAINT),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(940.0),
+            left: Val::Px(620.0),
+            width: Val::Px(1240.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        NowPlayingElement::Hint,
+    ));
 }
 
 // ─── Systems ─────────────────────────────────────────────────────────
@@ -1544,13 +1685,14 @@ fn gamepad_event_system(
     let (mut cursor_idx, n) = match engine_res.menu_level {
         MenuLevel::Root => (menu_index_of(engine_res.cursor), MENU.len()),
         MenuLevel::WatchSubmenu => {
-            let lib_size = library_snap
-                .0
-                .lock()
-                .map(|s| s.entries.len())
-                .unwrap_or(0);
+            let lib_size = library_snap.0.lock().map(|s| s.entries.len()).unwrap_or(0);
             (engine_res.submenu_cursor, lib_size)
         }
+        // NowPlaying is a single-item full-screen view. cursor_idx is
+        // unused (no list to navigate); n=1 ensures the DPad guards
+        // (`if n == 0`) don't fire, while modulo-arithmetic stays a
+        // safe no-op.
+        MenuLevel::NowPlaying => (0, 1),
         level => (engine_res.submenu_cursor, submenu_for(level).len()),
     };
 
@@ -1699,9 +1841,25 @@ fn gamepad_event_system(
                     // still show the overlay because the user pressed A
                     // and deserves feedback (the previous press's overlay
                     // would already be visible anyway from its own set).
-                    engine_res.pending_watch =
-                        Some((title.clone(), std::time::Instant::now()));
+                    engine_res.pending_watch = Some((title.clone(), std::time::Instant::now()));
                     try_dispatch_watch(&mut engine_res, &daemon_url, &title);
+                    // Phase 3 (2026-05-28): transition to NowPlaying so
+                    // the user sees title + state + position immediately.
+                    // The submenu_cursor is preserved so B restores the
+                    // library cursor on the same entry. The pending_watch
+                    // overlay still paints over the NowPlaying view
+                    // during cold-start (overlay z-order > NowPlaying);
+                    // once it times out (`WATCH_OVERLAY_TIMEOUT_MS`), the
+                    // NowPlaying surface is fully visible.
+                    engine_res.menu_level = MenuLevel::NowPlaying;
+                    info!("Enter NowPlaying view");
+                }
+                MenuLevel::NowPlaying => {
+                    // A on NowPlaying is currently a no-op. Reserved for
+                    // a future "select the active stream → no-op /
+                    // resume / replay" affordance once spela exposes
+                    // pause/resume via the daemon /watch surface.
+                    info!("A on NowPlaying: no-op (reserved)");
                 }
             },
             GamepadButton::East => match engine_res.menu_level {
@@ -1726,6 +1884,16 @@ fn gamepad_event_system(
                     engine_res.menu_level = MenuLevel::Root;
                     engine_res.cursor = MenuItem::Watch;
                     cursor_idx = menu_index_of(MenuItem::Watch);
+                }
+                MenuLevel::NowPlaying => {
+                    // B from NowPlaying returns to WatchSubmenu so the
+                    // user can pick another title without leaving the
+                    // Watch flow. submenu_cursor was preserved during
+                    // the A-press transition, so the library cursor
+                    // lands back on the entry the user dispatched.
+                    info!("Exit NowPlaying → WatchSubmenu (library cursor restored)");
+                    engine_res.menu_level = MenuLevel::WatchSubmenu;
+                    cursor_idx = engine_res.submenu_cursor;
                 }
             },
             GamepadButton::North => {
@@ -1780,6 +1948,11 @@ fn gamepad_event_system(
         MenuLevel::LightsSubmenu | MenuLevel::MusicSubmenu | MenuLevel::WatchSubmenu => {
             engine_res.submenu_cursor = cursor_idx
         }
+        // NowPlaying has no list to navigate (n=1, cursor_idx always 0),
+        // so the cursor write is a no-op. Don't touch submenu_cursor
+        // either — it's preserved during the WatchSubmenu→NowPlaying
+        // transition so B restores the library cursor.
+        MenuLevel::NowPlaying => {}
     }
 }
 
@@ -1952,13 +2125,8 @@ fn gilrs_wake_loop(proxy: EventLoopProxy<WinitUserEvent>) {
 /// ACTIVE_WAIT_MS again. Acceptable trade since first-press after
 /// idle is psychologically a "wake-up" action, not a navigation
 /// action.
-fn dynamic_wait_system(
-    engine_res: Res<EngineRes>,
-    mut settings: ResMut<WinitSettings>,
-) {
-    let target_wait_ms = if engine_res.since_input
-        < Duration::from_secs(IDLE_THRESHOLD_SECS)
-    {
+fn dynamic_wait_system(engine_res: Res<EngineRes>, mut settings: ResMut<WinitSettings>) {
+    let target_wait_ms = if engine_res.since_input < Duration::from_secs(IDLE_THRESHOLD_SECS) {
         ACTIVE_WAIT_MS
     } else {
         IDLE_WAIT_MS
@@ -2910,11 +3078,7 @@ fn menu_render_system(
     // Re-render on EITHER engine state change OR library snapshot change.
     // The poller updates the snapshot from a background thread; UI needs
     // to redraw when the library appears OR an entry's title changes.
-    let library_fingerprint = library_snap
-        .0
-        .lock()
-        .map(|s| s.entries.len())
-        .unwrap_or(0);
+    let library_fingerprint = library_snap.0.lock().map(|s| s.entries.len()).unwrap_or(0);
     if !engine_res.is_changed() && !library_snap.is_changed() {
         // Still re-check if WatchSubmenu and library size changed since last render
         // — handled implicitly via library_snap.is_changed() above.
@@ -2922,6 +3086,7 @@ fn menu_render_system(
     }
     let in_submenu = !matches!(engine_res.menu_level, MenuLevel::Root);
     let is_watch = matches!(engine_res.menu_level, MenuLevel::WatchSubmenu);
+    let is_now_playing = matches!(engine_res.menu_level, MenuLevel::NowPlaying);
     let static_submenu = submenu_for(engine_res.menu_level);
     let selected = if in_submenu {
         engine_res.submenu_cursor
@@ -2982,13 +3147,15 @@ fn menu_render_system(
 
     // Root menu: visible at Root level OR during WatchSubmenu (Slice
     // 1.5 keep-sidebar-visible fix; user expected sidebar to stay when
-    // browsing the library list to the right). LightsSubmenu/MusicSubmenu
-    // keep the old hide-root behavior because those submenus reuse the
-    // sidebar's x positions. `root_selected_idx` follows the engine
-    // cursor (MenuItem::Watch when in WatchSubmenu) so the sidebar's
-    // Watch row stays highlighted while the library browses.
+    // browsing the library list to the right) OR during NowPlaying
+    // (Phase 3 — same rationale, sidebar provides navigation context
+    // while the NowPlaying panel occupies the right area). LightsSubmenu
+    // /MusicSubmenu keep the old hide-root behavior because those
+    // submenus reuse the sidebar's x positions. `root_selected_idx`
+    // follows the engine cursor (MenuItem::Watch when in WatchSubmenu
+    // or NowPlaying) so the sidebar's Watch row stays highlighted.
     let root_selected_idx = menu_index_of(engine_res.cursor);
-    let show_root = !in_submenu || is_watch;
+    let show_root = !in_submenu || is_watch || is_now_playing;
     for (mut color, mut vis, label) in root_label_q.iter_mut() {
         *vis = if show_root {
             Visibility::Inherited
@@ -3114,9 +3281,7 @@ fn pending_watch_overlay_system(
     let now = std::time::Instant::now();
     let (visible, label) = match engine_res.pending_watch.as_ref() {
         Some((title, t)) => {
-            if now.duration_since(*t).as_millis()
-                > WATCH_OVERLAY_TIMEOUT_MS as u128
-            {
+            if now.duration_since(*t).as_millis() > WATCH_OVERLAY_TIMEOUT_MS as u128 {
                 (false, None)
             } else {
                 // Truncate over-long release titles for the overlay so
@@ -3153,6 +3318,79 @@ fn pending_watch_overlay_system(
     }
 }
 
+/// Phase-7 Phase 3 (2026-05-28) — paint the NowPlaying surface when
+/// `MenuLevel::NowPlaying` is active. Pulls title + status + position
+/// from `NowPlayingSnapshotRes` (background poller updated every
+/// `NOW_PLAYING_POLL_INTERVAL_SECS`), interpolates position between
+/// polls using `fetched_at` so the elapsed counter ticks visibly. All
+/// four NowPlayingElement entities are visibility-flipped together.
+#[allow(clippy::type_complexity)]
+fn now_playing_render_system(
+    engine_res: Res<EngineRes>,
+    snap: Res<now_playing::NowPlayingSnapshotRes>,
+    mut q: Query<(&mut Visibility, Option<&mut Text>, &NowPlayingElement)>,
+) {
+    let visible = matches!(engine_res.menu_level, MenuLevel::NowPlaying);
+    // Read the snapshot once, build the rendered fields, then iterate
+    // entities. Holding the lock across iter_mut() would deadlock the
+    // resource access. Position is interpolated forward by
+    // `(now - fetched_at)` when the stream is actively streaming, so
+    // the counter ticks every frame instead of jumping every poll.
+    let (title_text, status_text, position_text) = if visible {
+        let s = snap.0.lock().unwrap();
+        let raw_title = s.title.as_deref().unwrap_or("(no title)");
+        let title = now_playing::truncate_title(raw_title, 64);
+
+        let status_str = s.status.as_deref();
+        let is_streaming = matches!(status_str, Some("streaming"));
+        let elapsed = if is_streaming {
+            let drift = s
+                .fetched_at
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
+            s.position_secs + drift
+        } else {
+            s.position_secs
+        };
+        let has_position = elapsed > 0.0;
+        let status_lbl = now_playing::status_label(status_str, has_position).to_string();
+        let position = match s.duration_secs {
+            Some(d) if d > 0.0 => format!(
+                "{} / {}",
+                now_playing::format_hms(elapsed),
+                now_playing::format_hms(d)
+            ),
+            _ => now_playing::format_hms(elapsed),
+        };
+        (title, status_lbl, position)
+    } else {
+        (String::new(), String::new(), String::new())
+    };
+
+    for (mut vis, text, element) in q.iter_mut() {
+        *vis = if visible {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if !visible {
+            continue;
+        }
+        if let Some(mut t) = text {
+            let new_value = match element {
+                NowPlayingElement::Backing => continue,
+                NowPlayingElement::Title => &title_text,
+                NowPlayingElement::Status => &status_text,
+                NowPlayingElement::Position => &position_text,
+                NowPlayingElement::Hint => continue, // static text
+            };
+            if t.0 != *new_value {
+                t.0 = new_value.clone();
+            }
+        }
+    }
+}
+
 fn preview_render_system(
     engine_res: Res<EngineRes>,
     mut q: Query<(&mut Text, &mut Visibility, &PreviewElement)>,
@@ -3163,7 +3401,12 @@ fn preview_render_system(
     // Slice 1.5: hide preview pane content while WatchSubmenu is
     // active. The library list now lives at x=560/620 (where the
     // preview icon/label used to be) and would overlap unreadably.
-    let hide_for_watch = matches!(engine_res.menu_level, MenuLevel::WatchSubmenu);
+    // Phase 3 (2026-05-28): also hide during NowPlaying for the same
+    // reason — the NowPlaying surface occupies the right area.
+    let hide_for_watch = matches!(
+        engine_res.menu_level,
+        MenuLevel::WatchSubmenu | MenuLevel::NowPlaying
+    );
     let (icon, label, subtitle) = preview_for(engine_res.cursor);
     for (mut text, mut vis, element) in q.iter_mut() {
         *vis = if hide_for_watch {

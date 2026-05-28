@@ -23,6 +23,7 @@ use serde_json::Value;
 /// reverse-engineered from `~/Projects/spela/static/remote.html`'s
 /// rendering code — we only need the fields used by Phase 1 + 2.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // poster_url/year/kind consumed by Posters slice (Phase 2)
 pub struct LibraryEntry {
     /// Canonical filesystem-derived title; pass as `/play` body's `title`.
     pub raw_name: String,
@@ -80,9 +81,9 @@ fn extract_entry(v: &Value) -> Option<LibraryEntry> {
         .and_then(|x| x.as_str())
         .map(|s| s.to_string());
     let year = obj.get("year").and_then(|x| {
-        x.as_u64().map(|n| n as u32).or_else(|| {
-            x.as_str().and_then(|s| s.parse::<u32>().ok())
-        })
+        x.as_u64()
+            .map(|n| n as u32)
+            .or_else(|| x.as_str().and_then(|s| s.parse::<u32>().ok()))
     });
     let kind = obj
         .get("kind")
@@ -134,7 +135,10 @@ pub fn spawn_library_poller(spela_base_url: String, interval: Duration) -> Libra
     LibrarySnapshotRes(snap)
 }
 
-fn poll_once(base: &str, client: Option<&reqwest::blocking::Client>) -> Result<Vec<LibraryEntry>, String> {
+fn poll_once(
+    base: &str,
+    client: Option<&reqwest::blocking::Client>,
+) -> Result<Vec<LibraryEntry>, String> {
     let url = format!("{}/library", base);
     let resp = match client {
         Some(c) => c.get(&url).send(),
@@ -158,7 +162,11 @@ fn poll_once(base: &str, client: Option<&reqwest::blocking::Client>) -> Result<V
                 return Ok(arr.iter().filter_map(extract_entry).collect());
             }
         }
-        return Err(format!("parse {}: object with no known wrapper key (keys={:?})", url, obj.keys().collect::<Vec<_>>()));
+        return Err(format!(
+            "parse {}: object with no known wrapper key (keys={:?})",
+            url,
+            obj.keys().collect::<Vec<_>>()
+        ));
     } else {
         return Err(format!("parse {}: not an array or object", url));
     };
@@ -177,9 +185,9 @@ pub fn window_around(cursor: usize, total: usize) -> (usize, Vec<usize>) {
         return (0, vec![]);
     }
     let half = WATCH_VISIBLE_SLOTS / 2;
-    let start = if total <= WATCH_VISIBLE_SLOTS {
-        0
-    } else if cursor < half {
+    let start = if total <= WATCH_VISIBLE_SLOTS || cursor < half {
+        // Either the entire list fits inside one window, or the cursor
+        // is in the top `half` so the window starts at the top.
         0
     } else if cursor + (WATCH_VISIBLE_SLOTS - half) > total {
         total.saturating_sub(WATCH_VISIBLE_SLOTS)

@@ -516,8 +516,7 @@ async fn watch_handler(Json(req): Json<WatchReq>) -> impl IntoResponse {
     // Reject control chars (same hygiene as title); cap at 4096 bytes
     // (typical magnet is 400-600 chars; 4096 is generous, blocks abuse).
     let magnet_owned = match req.magnet.as_deref() {
-        None => None,
-        Some(m) if m.is_empty() => None,
+        None | Some("") => None,
         Some(m) if m.len() > 4096 => {
             return (
                 StatusCode::BAD_REQUEST,

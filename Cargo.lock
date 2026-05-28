@@ -4259,6 +4259,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bevy",
+ "gilrs",
  "reqwest",
  "serde",
  "serde_json",
