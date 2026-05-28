@@ -6,6 +6,19 @@ description = "Bedroom Shannon kiosk UI — retro-themed, Xbox-controller-driven
 authors = ["Fredrik Branstrom"]
 license = "AGPL-3.0-or-later"
 
+[features]
+# `gst-renderer` opt-in pulls gstreamer-rs + glib for the
+# `spela-renderer` binary. NOT enabled by default because (a) those
+# crates are heavy + slow to build, (b) only the Shannon target needs
+# them (the shannon-kiosk + shannon-kiosk-actions binaries don't use
+# GStreamer). Build via:
+#     cargo build --bin spela-renderer --features gst-renderer
+# or via the cross-build path:
+#     cross build --target aarch64-unknown-linux-gnu --release \
+#         --bin spela-renderer --features gst-renderer
+default = []
+gst-renderer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:glib"]
+
 [dependencies]
 # Bevy: game-engine for the retro-themed UI.
 # default-features = true gives gamepad support (bevy_gilrs), text rendering,
@@ -98,6 +111,23 @@ gilrs = "0.11"
 # known-good). Without this, `cargo build` errors out with "candidate
 # versions found which didn't match" for zune-core.
 zune-core = "=0.5.0-rc2"
+
+# spela-renderer dependencies (opt-in via `gst-renderer` feature). Kept
+# optional so the default kiosk binaries don't pull in the heavy
+# gstreamer-sys / glib-sys chain. The version pins target the
+# `gstreamer:0.24` line (released against gstreamer 1.22+ which is
+# what Trixie ships).
+gstreamer = { version = "0.24", optional = true, default-features = false }
+gstreamer-app = { version = "0.24", optional = true, default-features = false }
+gstreamer-video = { version = "0.24", optional = true, default-features = false }
+glib = { version = "0.20", optional = true, default-features = false }
+
+[[bin]]
+name = "spela-renderer"
+path = "src/bin/spela-renderer.rs"
+# Gated behind the gst-renderer feature so `cargo build` (no flags)
+# stays lean. The kiosk + actions binaries continue to build by default.
+required-features = ["gst-renderer"]
 
 # Performance profile for release — Bevy is heavy without optimizations
 [profile.release]

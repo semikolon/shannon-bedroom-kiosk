@@ -13,13 +13,29 @@
 #   - libasound2-dev:arm64    → defensive; some Bevy transitive deps probe ALSA at build.
 #   - libssl-dev:arm64        → defensive (curl-sys/native-tls in the dependency tree).
 #   - pkg-config              → cross-arch pkg-config lookups via PKG_CONFIG_ALLOW_CROSS=1.
+#   - libgstreamer1.0-dev:arm64 + plugins-base (2026-05-28)
+#                              → spela-renderer binary (gst-renderer feature).
+#                                plugins-base supplies audio/video helper headers.
+#                                NOTE: plugins-bad-dev:arm64 is SKIPPED — its
+#                                arm64 build depends on libopencv-dev:arm64
+#                                which has unresolvable multi-arch conflicts
+#                                in the cross-rs :edge image. At runtime on
+#                                Shannon the plugins-bad ELEMENTS (hlsdemux,
+#                                tsdemux) are present via the Trixie package
+#                                already installed; we only need the headers
+#                                from plugins-base + core for the gstreamer-rs
+#                                bindings to compile (the bindings cover the
+#                                GstElement API generically, no per-element
+#                                header is needed). Image-rebuild fires once
+#                                on next `cross build --features gst-renderer`
+#                                (~5-10 min one-time).
 
 [target.aarch64-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:edge"
 pre-build = [
     "dpkg --add-architecture arm64",
     "apt-get update",
-    "apt-get install -y libudev-dev:arm64 libwayland-dev:arm64 libxkbcommon-dev:arm64 libx11-dev:arm64 libxcb1-dev:arm64 libxcursor-dev:arm64 libxi-dev:arm64 libxrandr-dev:arm64 libxinerama-dev:arm64 libasound2-dev:arm64 libssl-dev:arm64 pkg-config",
+    "apt-get install -y libudev-dev:arm64 libwayland-dev:arm64 libxkbcommon-dev:arm64 libx11-dev:arm64 libxcb1-dev:arm64 libxcursor-dev:arm64 libxi-dev:arm64 libxrandr-dev:arm64 libxinerama-dev:arm64 libasound2-dev:arm64 libssl-dev:arm64 pkg-config libgstreamer1.0-dev:arm64 libgstreamer-plugins-base1.0-dev:arm64",
 ]
 
 [build.env]
