@@ -200,13 +200,13 @@ fn build_pipeline(hls_url: &str, audio_device: &str) -> Result<gst::Pipeline, St
         if name.starts_with("video/x-h264") {
             if let Ok(sink) = vsp.lock() {
                 if !sink.is_linked() {
-                    let _ = src_pad.link(&sink);
+                    let _ = src_pad.link(&*sink);
                 }
             }
         } else if name.starts_with("audio/mpeg") {
             if let Ok(sink) = asp.lock() {
                 if !sink.is_linked() {
-                    let _ = src_pad.link(&sink);
+                    let _ = src_pad.link(&*sink);
                 }
             }
         }
