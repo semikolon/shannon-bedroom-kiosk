@@ -32,12 +32,15 @@ use crate::context::Media;
 use std::time::{Duration, SystemTime};
 
 /// One snapshot of an HA media_player entity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MediaPlayerState {
     /// The HA state field — `"playing"` / `"paused"` / `"idle"` / `"off"`
     /// / `"on"` / `"unknown"` / `"unavailable"`.
     pub state: String,
     pub media_title: Option<String>,
+    /// Artist field — populated by music players (Spotify/spotifyd). Empty
+    /// for TV/video casters that don't carry per-track metadata.
+    pub media_artist: Option<String>,
     pub media_content_type: Option<String>,
     /// Optional position + duration (seconds) — drives resume-offer text.
     pub media_position: Option<u32>,
@@ -60,6 +63,11 @@ pub enum BinarySensorState {
 #[derive(Debug, Clone, Default)]
 pub struct HaPollState {
     pub media_player: Option<MediaPlayerState>,
+    /// Second media_player tracked separately — the music/Spotify endpoint
+    /// (configured via `HA_MUSIC_PLAYER_ENTITY`). Drives the Music-NowPlaying
+    /// view's title + artist + state when the user wakes the kiosk with
+    /// music playing or paused.
+    pub music_player: Option<MediaPlayerState>,
     pub occupancy: Option<BinarySensorState>,
     pub last_poll_at: Option<SystemTime>,
     pub last_poll_result: PollResult,
@@ -174,6 +182,7 @@ mod tests {
                 media_position: Some(120),
                 media_duration: Some(2400),
                 app_name: Some("Netflix".into()),
+                media_artist: None,
             }),
             ..Default::default()
         };
@@ -190,6 +199,7 @@ mod tests {
                 media_position: None,
                 media_duration: None,
                 app_name: Some("Spotify".into()),
+                media_artist: None,
             }),
             ..Default::default()
         };
@@ -209,6 +219,7 @@ mod tests {
                 media_position: None,
                 media_duration: None,
                 app_name: None,
+                media_artist: None,
             }),
             ..Default::default()
         };
@@ -226,6 +237,7 @@ mod tests {
                     media_position: None,
                     media_duration: None,
                     app_name: None,
+                    media_artist: None,
                 }),
                 ..Default::default()
             };
@@ -248,6 +260,7 @@ mod tests {
                 media_position: Some(300),
                 media_duration: Some(3600),
                 app_name: None,
+                media_artist: None,
             }),
             ..Default::default()
         };

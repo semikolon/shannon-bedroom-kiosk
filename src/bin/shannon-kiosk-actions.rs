@@ -47,6 +47,11 @@ struct AppState {
     /// Configured HA entity to poll for media-player state. Empty string
     /// means "don't poll media_player".
     media_player_entity: String,
+    /// Configured HA entity to poll for music-player state (Spotify /
+    /// spotifyd typically). Polled separately from the TV media_player
+    /// so the Music-NowPlaying view has its own title/artist/state
+    /// independent of TV casting. Empty = skip.
+    music_player_entity: String,
     /// Configured HA entity to poll for occupancy. Empty = skip.
     occupancy_entity: String,
     /// How often to refresh `ha_poll`. 30s is a reasonable default for
@@ -77,6 +82,7 @@ async fn main() {
             .expect("reqwest client"),
         ha_poll: Mutex::new(HaPollState::default()),
         media_player_entity: env_or("HA_MEDIA_PLAYER_ENTITY", "media_player.tv"),
+        music_player_entity: env_or("HA_MUSIC_PLAYER_ENTITY", "media_player.music"),
         occupancy_entity: env_or("HA_OCCUPANCY_ENTITY", ""),
         poll_interval: parse_secs("HA_POLL_INTERVAL_SECS", 30),
     });
@@ -158,6 +164,13 @@ async fn poll_once(state: &Arc<AppState>) -> PollResult {
         }
     }
 
+    if !state.music_player_entity.is_empty() {
+        let r = poll_music_player(state).await;
+        if rank_result(r) > rank_result(worst) {
+            worst = r;
+        }
+    }
+
     if !state.occupancy_entity.is_empty() {
         let r = poll_occupancy(state).await;
         if rank_result(r) > rank_result(worst) {
@@ -194,6 +207,20 @@ async fn poll_media_player(state: &Arc<AppState>) -> PollResult {
             Some(mp) => {
                 let mut cache = state.ha_poll.lock().await;
                 cache.media_player = Some(mp);
+                PollResult::Ok
+            }
+            None => PollResult::ParseError,
+        },
+        Err(r) => r,
+    }
+}
+
+async fn poll_music_player(state: &Arc<AppState>) -> PollResult {
+    match fetch_entity(state, &state.music_player_entity).await {
+        Ok(v) => match parse_media_player(&v) {
+            Some(mp) => {
+                let mut cache = state.ha_poll.lock().await;
+                cache.music_player = Some(mp);
                 PollResult::Ok
             }
             None => PollResult::ParseError,
@@ -253,6 +280,10 @@ fn parse_media_player(v: &Value) -> Option<MediaPlayerState> {
         .and_then(|a| a.get("media_title"))
         .and_then(|x| x.as_str())
         .map(String::from);
+    let media_artist = attrs
+        .and_then(|a| a.get("media_artist"))
+        .and_then(|x| x.as_str())
+        .map(String::from);
     let media_content_type = attrs
         .and_then(|a| a.get("media_content_type"))
         .and_then(|x| x.as_str())
@@ -272,6 +303,7 @@ fn parse_media_player(v: &Value) -> Option<MediaPlayerState> {
     Some(MediaPlayerState {
         state,
         media_title,
+        media_artist,
         media_content_type,
         media_position,
         media_duration,
@@ -302,6 +334,18 @@ async fn ha_state_handler(State(s): State<Arc<AppState>>) -> Json<Value> {
         json!({
             "state": mp.state,
             "media_title": mp.media_title,
+            "media_artist": mp.media_artist,
+            "media_content_type": mp.media_content_type,
+            "media_position": mp.media_position,
+            "media_duration": mp.media_duration,
+            "app_name": mp.app_name,
+        })
+    });
+    let music_player = cache.music_player.as_ref().map(|mp| {
+        json!({
+            "state": mp.state,
+            "media_title": mp.media_title,
+            "media_artist": mp.media_artist,
             "media_content_type": mp.media_content_type,
             "media_position": mp.media_position,
             "media_duration": mp.media_duration,
@@ -315,6 +359,7 @@ async fn ha_state_handler(State(s): State<Arc<AppState>>) -> Json<Value> {
     });
     Json(json!({
         "media_player": media_player,
+        "music_player": music_player,
         "occupancy": occupancy,
         "engine_media": match cache.engine_media() {
             Media::None => "none",

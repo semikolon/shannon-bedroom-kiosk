@@ -222,6 +222,14 @@ enum MenuLevel {
     /// Content is DYNAMIC (from `now_playing::NowPlayingSnapshotRes`) and
     /// has no submenu list — render path special-cases this variant.
     NowPlaying,
+    /// Music Now-Playing view (2026-05-28): full-screen surface showing
+    /// track title + artist + state from the daemon's `music_player`
+    /// field. Entered on wake when music is playing or paused (engine
+    /// transitions just_entered_kiosk handle the routing). A=pause/play
+    /// (via daemon /media/default/play_pause), DPad-LR=prev/next,
+    /// B=back to Root, Y=ForceOff. Manual nav Root→Music with music
+    /// playing also routes here for unified UX.
+    MusicNowPlaying,
 }
 
 struct SubmenuTile {
@@ -282,6 +290,9 @@ fn submenu_for(level: MenuLevel) -> &'static [SubmenuTile] {
         // gamepad_event_system uses an n=1 short-circuit and the render
         // path uses now_playing::NowPlayingSnapshotRes.
         MenuLevel::NowPlaying => &[],
+        // MusicNowPlaying mirrors NowPlaying: single-item full-screen,
+        // content sourced from HaSnapshot.music_* fields.
+        MenuLevel::MusicNowPlaying => &[],
     }
 }
 
@@ -307,6 +318,13 @@ struct EngineRes {
     outdoor_brightness: f32,
     ha_ribbon_title: Option<String>,
     ha_occupancy: bool,
+    /// Music-player state from HA daemon (playing / paused / idle / off /
+    /// etc). When playing/paused, the wake routing in `engine_tick_system`
+    /// sets MenuLevel::MusicNowPlaying instead of Root, and the manual
+    /// Root→Music nav also routes there for unified UX.
+    music_state: Option<String>,
+    music_title: Option<String>,
+    music_artist: Option<String>,
     /// Shared snapshot read on every Bevy tick. None until first
     /// successful poll (daemon down on dev iteration). Mac dev runs
     /// fine without a daemon — engine just uses defaults.
@@ -374,6 +392,13 @@ struct HaSnapshot {
     media: Media,
     resumable_title: Option<String>,
     occupancy_present: bool,
+    /// Music-player state for Music-NowPlaying view (spotifyd / Spotify-
+    /// Connect endpoint). Populated from daemon's `music_player` field.
+    /// `music_state` is `"playing"`/`"paused"`/`"idle"`/`"off"`/etc; UI
+    /// renders the view when state ∈ {playing, paused}.
+    music_state: Option<String>,
+    music_title: Option<String>,
+    music_artist: Option<String>,
     /// Wall-clock time the snapshot was last refreshed (for staleness
     /// detection — Bevy renders without HA data if last poll > 5×
     /// poll_interval old).
@@ -444,6 +469,9 @@ impl Default for EngineRes {
             outdoor_brightness: 0.6,
             ha_ribbon_title: None,
             ha_occupancy: false,
+            music_state: None,
+            music_title: None,
+            music_artist: None,
             ha_snapshot: None,
             ribbon_text: None,
             // Initial TV state: ON (the kiosk renders content). The
@@ -543,6 +571,19 @@ enum NowPlayingElement {
 /// OR download still in flight OR download failed).
 #[derive(Component)]
 struct WatchPosterPreview;
+
+/// Music-NowPlaying view markers (2026-05-28). Same layout pattern as
+/// NowPlayingElement: backing card + title + artist + state + hint.
+/// Visibility flipped by `music_now_playing_render_system` when
+/// `MenuLevel::MusicNowPlaying` is active.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum MusicNowPlayingElement {
+    Backing,
+    Title,
+    Artist,
+    State,
+    Hint,
+}
 
 #[derive(Component)]
 struct StateBadge;
@@ -815,6 +856,7 @@ fn main() {
                 state_badge_system,
                 pending_watch_overlay_system,
                 now_playing_render_system,
+                music_now_playing_render_system,
                 watch_poster_request_system,
                 watch_poster_promote_system,
                 watch_poster_preview_system,
@@ -1716,6 +1758,96 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         Visibility::Hidden,
         WatchPosterPreview,
     ));
+
+    // ─── Music-NowPlaying view (2026-05-28) ─────────────────────────────
+    // Same layout pattern as Watch NowPlaying. Right-side panel; sidebar
+    // stays visible (show_root includes MusicNowPlaying). Title big,
+    // artist below, state below that, hint row at bottom.
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(0.0),
+            left: Val::Px(540.0),
+            width: Val::Px(1380.0),
+            height: Val::Px(1080.0),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.04, 0.05, 0.04, 0.92)),
+        Visibility::Hidden,
+        MusicNowPlayingElement::Backing,
+    ));
+    commands.spawn((
+        Text::new("(no track)"),
+        TextFont {
+            font: fonts.bold.clone(),
+            font_size: 72.0,
+            ..default()
+        },
+        TextColor(OAT_MILK),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(280.0),
+            left: Val::Px(620.0),
+            width: Val::Px(1240.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        MusicNowPlayingElement::Title,
+    ));
+    commands.spawn((
+        Text::new(""),
+        TextFont {
+            font: fonts.semibold.clone(),
+            font_size: 48.0,
+            ..default()
+        },
+        TextColor(OAT_DIM),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(400.0),
+            left: Val::Px(620.0),
+            width: Val::Px(1240.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        MusicNowPlayingElement::Artist,
+    ));
+    commands.spawn((
+        Text::new("▶ PLAYING"),
+        TextFont {
+            font: fonts.semibold.clone(),
+            font_size: 56.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.65, 0.92, 0.55)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(540.0),
+            left: Val::Px(620.0),
+            width: Val::Px(1240.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        MusicNowPlayingElement::State,
+    ));
+    commands.spawn((
+        Text::new("A = pause/play · ◀▶ = prev/next · B = back · Y = ALL OFF"),
+        TextFont {
+            font: fonts.semibold.clone(),
+            font_size: 28.0,
+            ..default()
+        },
+        TextColor(OAT_FAINT),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(940.0),
+            left: Val::Px(620.0),
+            width: Val::Px(1240.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        MusicNowPlayingElement::Hint,
+    ));
 }
 
 // ─── Systems ─────────────────────────────────────────────────────────
@@ -1743,6 +1875,10 @@ fn gamepad_event_system(
         // (`if n == 0`) don't fire, while modulo-arithmetic stays a
         // safe no-op.
         MenuLevel::NowPlaying => (0, 1),
+        // MusicNowPlaying same shape — single full-screen view; DPad
+        // events route to media prev/next via the dedicated arm below
+        // rather than the cursor-navigation default.
+        MenuLevel::MusicNowPlaying => (0, 1),
         level => (engine_res.submenu_cursor, submenu_for(level).len()),
     };
 
@@ -1781,6 +1917,18 @@ fn gamepad_event_system(
                     engine_res.menu_level, cursor_idx
                 );
             }
+            GamepadButton::DPadLeft
+                if matches!(engine_res.menu_level, MenuLevel::MusicNowPlaying) =>
+            {
+                info!("Music NowPlaying: DPadLeft = prev");
+                try_dispatch_media(&mut engine_res, &daemon_url, MUSIC_DEFAULT_ENTITY, "prev");
+            }
+            GamepadButton::DPadRight
+                if matches!(engine_res.menu_level, MenuLevel::MusicNowPlaying) =>
+            {
+                info!("Music NowPlaying: DPadRight = next");
+                try_dispatch_media(&mut engine_res, &daemon_url, MUSIC_DEFAULT_ENTITY, "next");
+            }
             GamepadButton::South => match engine_res.menu_level {
                 MenuLevel::Root => {
                     let item = MENU[cursor_idx].item;
@@ -1795,10 +1943,25 @@ fn gamepad_event_system(
                             info!("Enter LightsSubmenu (cursor=0=bedroom)");
                         }
                         MenuItem::Music => {
-                            engine_res.menu_level = MenuLevel::MusicSubmenu;
-                            engine_res.submenu_cursor = 0;
-                            cursor_idx = 0;
-                            info!("Enter MusicSubmenu (cursor=0=play_pause)");
+                            // Unified UX: if music is playing or paused,
+                            // route directly into MusicNowPlaying for
+                            // 1-press pause + DPad-LR prev/next. Else
+                            // open the submenu (play_pause from there
+                            // starts playback).
+                            let music_active = engine_res
+                                .music_state
+                                .as_deref()
+                                .map(|s| matches!(s, "playing" | "paused"))
+                                .unwrap_or(false);
+                            if music_active {
+                                engine_res.menu_level = MenuLevel::MusicNowPlaying;
+                                info!("Enter MusicNowPlaying (music active)");
+                            } else {
+                                engine_res.menu_level = MenuLevel::MusicSubmenu;
+                                engine_res.submenu_cursor = 0;
+                                cursor_idx = 0;
+                                info!("Enter MusicSubmenu (cursor=0=play_pause)");
+                            }
                         }
                         MenuItem::Sleep => {
                             // A on SLEEP = bedroom wind-down (Fredrik
@@ -1911,6 +2074,15 @@ fn gamepad_event_system(
                     // pause/resume via the daemon /watch surface.
                     info!("A on NowPlaying: no-op (reserved)");
                 }
+                MenuLevel::MusicNowPlaying => {
+                    info!("Music NowPlaying: A = play_pause");
+                    try_dispatch_media(
+                        &mut engine_res,
+                        &daemon_url,
+                        MUSIC_DEFAULT_ENTITY,
+                        "play_pause",
+                    );
+                }
             },
             GamepadButton::East => match engine_res.menu_level {
                 MenuLevel::Root => {
@@ -1944,6 +2116,12 @@ fn gamepad_event_system(
                     info!("Exit NowPlaying → WatchSubmenu (library cursor restored)");
                     engine_res.menu_level = MenuLevel::WatchSubmenu;
                     cursor_idx = engine_res.submenu_cursor;
+                }
+                MenuLevel::MusicNowPlaying => {
+                    info!("Exit MusicNowPlaying → Root (cursor on Music tile)");
+                    engine_res.menu_level = MenuLevel::Root;
+                    engine_res.cursor = MenuItem::Music;
+                    cursor_idx = menu_index_of(MenuItem::Music);
                 }
             },
             GamepadButton::North => {
@@ -2002,7 +2180,7 @@ fn gamepad_event_system(
         // so the cursor write is a no-op. Don't touch submenu_cursor
         // either — it's preserved during the WatchSubmenu→NowPlaying
         // transition so B restores the library cursor.
-        MenuLevel::NowPlaying => {}
+        MenuLevel::NowPlaying | MenuLevel::MusicNowPlaying => {}
     }
 }
 
@@ -2242,11 +2420,17 @@ fn engine_tick_system(
                 engine_res.media = snap.media;
                 engine_res.ha_ribbon_title = snap.resumable_title.clone();
                 engine_res.ha_occupancy = snap.occupancy_present;
+                engine_res.music_state = snap.music_state.clone();
+                engine_res.music_title = snap.music_title.clone();
+                engine_res.music_artist = snap.music_artist.clone();
             } else {
                 // No fresh data — clear to safe defaults so a stale
                 // playing-media state doesn't pin Content state forever.
                 engine_res.media = Media::None;
                 engine_res.ha_ribbon_title = None;
+                engine_res.music_state = None;
+                engine_res.music_title = None;
+                engine_res.music_artist = None;
             }
         }
     }
@@ -2315,16 +2499,33 @@ fn engine_tick_system(
         // Watch/Lights; resetting the submenu here can also undo an
         // A-on-Lights open. Preserve direct input; keep prediction/reset
         // for passive/context returns.
+        let music_active = engine_res
+            .music_state
+            .as_deref()
+            .map(|s| matches!(s, "playing" | "paused"))
+            .unwrap_or(false);
         if !fresh {
             if let Some(predicted) = hint.cursor {
                 engine_res.cursor = predicted;
             }
-            // Reset submenu state on Kiosk re-entry — don't strand the user
-            // in a stale Lights submenu after the screen had been off /
-            // ambient. Pairing with the snap-back fix's discipline of
-            // "context-fill on RETURN" (design § 13.7).
-            engine_res.menu_level = MenuLevel::Root;
-            engine_res.submenu_cursor = 0;
+            // Music-active wake routes to MusicNowPlaying for 1-press
+            // pause + DPad-LR prev/next. Otherwise reset to Root (don't
+            // strand the user in a stale Lights submenu after the screen
+            // had been off / ambient — design § 13.7).
+            if music_active {
+                engine_res.menu_level = MenuLevel::MusicNowPlaying;
+                engine_res.cursor = MenuItem::Music;
+            } else {
+                engine_res.menu_level = MenuLevel::Root;
+                engine_res.submenu_cursor = 0;
+            }
+        } else if music_active && matches!(engine_res.menu_level, MenuLevel::Root) {
+            // Fresh input wake from Off with music active: route into
+            // MusicNowPlaying so the press lands on a useful surface
+            // immediately (instead of Root, which would require another
+            // navigation to reach music control).
+            engine_res.menu_level = MenuLevel::MusicNowPlaying;
+            engine_res.cursor = MenuItem::Music;
         } else {
             info!("Kiosk entry prediction/reset skipped: fresh input already changed UI");
         }
@@ -3046,10 +3247,28 @@ fn parse_ha_state(v: &serde_json::Value) -> HaSnapshot {
         .get("occupancy_present")
         .and_then(|x| x.as_bool())
         .unwrap_or(false);
+    let music = v.get("music_player").and_then(|m| m.as_object());
+    let music_state = music
+        .and_then(|m| m.get("state"))
+        .and_then(|x| x.as_str())
+        .map(String::from);
+    let music_title = music
+        .and_then(|m| m.get("media_title"))
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let music_artist = music
+        .and_then(|m| m.get("media_artist"))
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
     HaSnapshot {
         media,
         resumable_title,
         occupancy_present,
+        music_state,
+        music_title,
+        music_artist,
         refreshed_at: Some(std::time::Instant::now()),
     }
 }
@@ -3136,7 +3355,10 @@ fn menu_render_system(
     }
     let in_submenu = !matches!(engine_res.menu_level, MenuLevel::Root);
     let is_watch = matches!(engine_res.menu_level, MenuLevel::WatchSubmenu);
-    let is_now_playing = matches!(engine_res.menu_level, MenuLevel::NowPlaying);
+    let is_now_playing = matches!(
+        engine_res.menu_level,
+        MenuLevel::NowPlaying | MenuLevel::MusicNowPlaying
+    );
     let static_submenu = submenu_for(engine_res.menu_level);
     let selected = if in_submenu {
         engine_res.submenu_cursor
@@ -3508,6 +3730,70 @@ fn watch_poster_preview_system(
     }
 }
 
+/// 2026-05-28 — paint the Music-NowPlaying surface when
+/// `MenuLevel::MusicNowPlaying` is active. Pulls title + artist +
+/// state from `EngineRes.music_*` fields (kept fresh by the ha-state
+/// poller via `parse_ha_state`).
+#[allow(clippy::type_complexity)]
+fn music_now_playing_render_system(
+    engine_res: Res<EngineRes>,
+    mut q: Query<(&mut Visibility, Option<&mut Text>, &MusicNowPlayingElement)>,
+) {
+    let visible = matches!(engine_res.menu_level, MenuLevel::MusicNowPlaying);
+    let (title_text, artist_text, state_text) = if visible {
+        let title = engine_res
+            .music_title
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(no track)")
+            .to_string();
+        let artist = engine_res
+            .music_artist
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_default();
+        let state_str = match engine_res.music_state.as_deref() {
+            Some("playing") => "▶ PLAYING",
+            Some("paused") => "⏸ PAUSED",
+            Some("idle") => "■ IDLE",
+            Some("off") => "✕ OFF",
+            Some(other) => match other.is_empty() {
+                true => "—",
+                false => other,
+            },
+            None => "—",
+        }
+        .to_string();
+        (title, artist, state_str)
+    } else {
+        (String::new(), String::new(), String::new())
+    };
+
+    for (mut vis, text, element) in q.iter_mut() {
+        *vis = if visible {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if !visible {
+            continue;
+        }
+        if let Some(mut t) = text {
+            let new_value = match element {
+                MusicNowPlayingElement::Backing => continue,
+                MusicNowPlayingElement::Title => &title_text,
+                MusicNowPlayingElement::Artist => &artist_text,
+                MusicNowPlayingElement::State => &state_text,
+                MusicNowPlayingElement::Hint => continue, // static text
+            };
+            if t.0 != *new_value {
+                t.0 = new_value.clone();
+            }
+        }
+    }
+}
+
 /// Phase-7 Phase 3 (2026-05-28) — paint the NowPlaying surface when
 /// `MenuLevel::NowPlaying` is active. Pulls title + status + position
 /// from `NowPlayingSnapshotRes` (background poller updated every
@@ -3595,7 +3881,7 @@ fn preview_render_system(
     // reason — the NowPlaying surface occupies the right area.
     let hide_for_watch = matches!(
         engine_res.menu_level,
-        MenuLevel::WatchSubmenu | MenuLevel::NowPlaying
+        MenuLevel::WatchSubmenu | MenuLevel::NowPlaying | MenuLevel::MusicNowPlaying
     );
     let (icon, label, subtitle) = preview_for(engine_res.cursor);
     for (mut text, mut vis, element) in q.iter_mut() {
