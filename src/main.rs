@@ -68,6 +68,13 @@ mod now_playing;
 mod posters;
 mod watch_ui;
 
+/// Phase 2B (2026-05-28) — visible slot count for the poster grid view
+/// in WatchSubmenu. 5 cols × 2 rows = 10 simultaneous posters; matches
+/// the prior text-list slot count so the windowing math from
+/// `watch_ui::window_around` carries over directly.
+const WATCH_GRID_SLOTS: usize = 10;
+const WATCH_GRID_COLS: usize = 5;
+
 // ─── Embedded font assets (commit-time bundled into the binary) ──────
 const SHARP_SANS_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/SharpSans-Semibold.otf");
 const SHARP_SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/SharpSans-Bold.otf");
@@ -569,8 +576,33 @@ enum NowPlayingElement {
 /// currently-cursor'd entry's poster (downloaded async by the poster
 /// thread). Hidden when no poster is available (entry has no poster_url
 /// OR download still in flight OR download failed).
+///
+/// SUPERSEDED by Phase 2B grid (`WatchPosterTile` + `WatchPosterGridTitle`)
+/// but kept hidden in-place so existing wiring stays operational while
+/// the grid is the primary surface.
 #[derive(Component)]
 struct WatchPosterPreview;
+
+/// Phase 2B (2026-05-28) — one slot in the 5×2 poster grid. `slot` ∈
+/// 0..10 — column = slot % 5, row = slot / 5. The grid windowing logic
+/// in `watch_poster_grid_system` maps slot → library index based on
+/// cursor position, so slot positions are static but their library
+/// content shifts as the user scrolls.
+#[derive(Component)]
+struct WatchPosterTile {
+    slot: usize,
+}
+
+/// Phase 2B — title label paired with each poster tile (below the poster).
+#[derive(Component)]
+struct WatchPosterTileTitle {
+    slot: usize,
+}
+
+/// Phase 2B — header line above the grid that shows the cursor entry's
+/// title + year. Updated by `watch_poster_grid_system`.
+#[derive(Component)]
+struct WatchGridCursorHeader;
 
 /// Music-NowPlaying view markers (2026-05-28). Same layout pattern as
 /// NowPlayingElement: backing card + title + artist + state + hint.
@@ -860,6 +892,7 @@ fn main() {
                 watch_poster_request_system,
                 watch_poster_promote_system,
                 watch_poster_preview_system,
+                watch_poster_grid_system,
             ),
         )
         .run();
@@ -1848,6 +1881,84 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         Visibility::Hidden,
         MusicNowPlayingElement::Hint,
     ));
+
+    // ─── Phase 2B: Watch UI poster grid (5×2) ───────────────────────────
+    // 10 poster tiles + 10 title labels + 1 cursor header line. All
+    // hidden by default; the watch_poster_grid_system flips visibility
+    // when WatchSubmenu is active and updates tile content from the
+    // library snapshot windowed around the cursor.
+    //
+    // Layout: x_start=320 (right of sidebar), y_start=180 (under header),
+    // tile=240×360 (3:2 TMDB poster), gutter=30. 5 cols × 2 rows fits
+    // 1620×780 area cleanly.
+    const GRID_X_START: f32 = 320.0;
+    const GRID_Y_START: f32 = 180.0;
+    const GRID_TILE_W: f32 = 240.0;
+    const GRID_TILE_H: f32 = 360.0;
+    const GRID_GUTTER_X: f32 = 30.0;
+    const GRID_GUTTER_Y: f32 = 60.0; // includes title-line spacing
+
+    // Cursor entry's title shown above the grid.
+    commands.spawn((
+        Text::new(""),
+        TextFont {
+            font: fonts.bold.clone(),
+            font_size: 48.0,
+            ..default()
+        },
+        TextColor(OAT_MILK),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(100.0),
+            left: Val::Px(GRID_X_START),
+            width: Val::Px(1600.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        WatchGridCursorHeader,
+    ));
+
+    for slot in 0..WATCH_GRID_SLOTS {
+        let col = (slot % 5) as f32;
+        let row = (slot / 5) as f32;
+        let x = GRID_X_START + col * (GRID_TILE_W + GRID_GUTTER_X);
+        let y = GRID_Y_START + row * (GRID_TILE_H + GRID_GUTTER_Y);
+
+        // Poster tile image.
+        commands.spawn((
+            ImageNode::default(),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(y),
+                left: Val::Px(x),
+                width: Val::Px(GRID_TILE_W),
+                height: Val::Px(GRID_TILE_H),
+                ..default()
+            },
+            Visibility::Hidden,
+            WatchPosterTile { slot },
+        ));
+
+        // Title text below the tile.
+        commands.spawn((
+            Text::new(""),
+            TextFont {
+                font: fonts.semibold.clone(),
+                font_size: 20.0,
+                ..default()
+            },
+            TextColor(OAT_DIM),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(y + GRID_TILE_H + 4.0),
+                left: Val::Px(x),
+                width: Val::Px(GRID_TILE_W),
+                ..default()
+            },
+            Visibility::Hidden,
+            WatchPosterTileTitle { slot },
+        ));
+    }
 }
 
 // ─── Systems ─────────────────────────────────────────────────────────
@@ -1894,16 +2005,25 @@ fn gamepad_event_system(
                     info!("DPadUp ignored — empty submenu (e.g., WatchSubmenu with no library)");
                     continue;
                 }
-                cursor_idx = if cursor_idx == 0 {
-                    n - 1
+                // Phase 2B grid: DPad-Up moves by WATCH_GRID_COLS in
+                // WatchSubmenu so navigation feels like a 5×N grid.
+                let step = if matches!(engine_res.menu_level, MenuLevel::WatchSubmenu) {
+                    WATCH_GRID_COLS
                 } else {
-                    cursor_idx - 1
+                    1
+                };
+                cursor_idx = if step <= cursor_idx {
+                    cursor_idx - step
+                } else if matches!(engine_res.menu_level, MenuLevel::WatchSubmenu) {
+                    cursor_idx // grid top-edge clamp (don't wrap rows)
+                } else {
+                    n - 1 // list wraps
                 };
                 // Latency diagnostic 2026-05-21: pair vs evtest /dev/input/event1
                 // kernel-arrival timestamp to measure kernel→Bevy delivery.
                 info!(
-                    "DPadUp: level={:?} cursor_idx={}",
-                    engine_res.menu_level, cursor_idx
+                    "DPadUp: level={:?} cursor_idx={} step={}",
+                    engine_res.menu_level, cursor_idx, step
                 );
             }
             GamepadButton::DPadDown => {
@@ -1911,11 +2031,36 @@ fn gamepad_event_system(
                     info!("DPadDown ignored — empty submenu");
                     continue;
                 }
-                cursor_idx = (cursor_idx + 1) % n;
+                let step = if matches!(engine_res.menu_level, MenuLevel::WatchSubmenu) {
+                    WATCH_GRID_COLS
+                } else {
+                    1
+                };
+                cursor_idx = if cursor_idx + step < n {
+                    cursor_idx + step
+                } else if matches!(engine_res.menu_level, MenuLevel::WatchSubmenu) {
+                    cursor_idx // grid bottom-edge clamp
+                } else {
+                    (cursor_idx + 1) % n // list wraps
+                };
                 info!(
-                    "DPadDown: level={:?} cursor_idx={}",
-                    engine_res.menu_level, cursor_idx
+                    "DPadDown: level={:?} cursor_idx={} step={}",
+                    engine_res.menu_level, cursor_idx, step
                 );
+            }
+            GamepadButton::DPadLeft if matches!(engine_res.menu_level, MenuLevel::WatchSubmenu) => {
+                if n > 0 {
+                    cursor_idx = cursor_idx.saturating_sub(1);
+                    info!("DPadLeft (grid): cursor_idx={}", cursor_idx);
+                }
+            }
+            GamepadButton::DPadRight
+                if matches!(engine_res.menu_level, MenuLevel::WatchSubmenu) =>
+            {
+                if n > 0 {
+                    cursor_idx = (cursor_idx + 1).min(n.saturating_sub(1));
+                    info!("DPadRight (grid): cursor_idx={}", cursor_idx);
+                }
             }
             GamepadButton::DPadLeft
                 if matches!(engine_res.menu_level, MenuLevel::MusicNowPlaying) =>
@@ -3466,21 +3611,13 @@ fn menu_render_system(
     for (mut text, mut color, mut vis, mut node, sub) in sub_label_q.iter_mut() {
         node.left = Val::Px(sub_label_left);
         if is_watch {
-            // Watch path: render from windowed library snapshot.
-            let slot = watch_slots.get(sub.index);
-            let (label, slot_selected) = match slot {
-                Some((s, sel)) => (s.as_str(), *sel),
-                None => ("", false),
-            };
-            if text.0 != label {
-                text.0 = label.to_string();
-            }
-            *vis = if slot.is_some() {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
-            color.0 = if slot_selected { OAT_MILK } else { OAT_DIM };
+            // Phase 2B (2026-05-28): the text list is retired —
+            // `watch_poster_grid_system` paints the 5×2 grid + its own
+            // title labels. Hide the legacy sub_label entities in
+            // WatchSubmenu to avoid overlap with the grid layout.
+            let _ = watch_slots; // retained for clippy + future use
+            *vis = Visibility::Hidden;
+            color.0 = OAT_DIM;
         } else {
             // Static path: LightsSubmenu / MusicSubmenu / Root (hidden).
             let tile = static_submenu.get(sub.index);
@@ -3504,19 +3641,10 @@ fn menu_render_system(
     for (mut text, mut color, mut vis, mut node, sub) in sub_icon_q.iter_mut() {
         node.left = Val::Px(sub_icon_left);
         if is_watch {
-            // Watch path: ICON_WATCH for every visible library slot.
-            let slot = watch_slots.get(sub.index);
-            let slot_selected = slot.map(|(_, sel)| *sel).unwrap_or(false);
-            let icon_char = ICON_WATCH.to_string();
-            if text.0 != icon_char {
-                text.0 = icon_char;
-            }
-            *vis = if slot.is_some() {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
-            color.0 = if slot_selected { OAT_MILK } else { OAT_DIM };
+            // Phase 2B retired the text-list icons — grid replaces them.
+            let _ = text; // retained for clippy
+            *vis = Visibility::Hidden;
+            color.0 = OAT_DIM;
         } else {
             let tile = static_submenu.get(sub.index);
             if let Some(tile) = tile {
@@ -3680,53 +3808,181 @@ fn watch_poster_promote_system(
     }
 }
 
-fn watch_poster_preview_system(
+/// Phase 2B (2026-05-28) — paint the 5×2 poster grid + cursor header
+/// when WatchSubmenu is active. Windowing math mirrors the prior text-
+/// list `watch_ui::window_around` so the cursor scrolls smoothly through
+/// the library.
+///
+/// Cursor highlight: bright tint on the cursor slot (1.0 alpha), dim
+/// tint on the rest (0.55 alpha). Titles show under each tile + a large
+/// title header above the grid.
+#[allow(clippy::type_complexity)]
+fn watch_poster_grid_system(
     engine_res: Res<EngineRes>,
     library_snap: Res<watch_ui::LibrarySnapshotRes>,
     registry: Res<posters::PosterRegistry>,
-    mut q: Query<(&mut ImageNode, &mut Visibility), With<WatchPosterPreview>>,
+    mut tile_q: Query<(&mut ImageNode, &mut Visibility, &WatchPosterTile)>,
+    mut title_q: Query<
+        (&mut Text, &mut Visibility, &WatchPosterTileTitle),
+        (Without<WatchPosterTile>, Without<WatchGridCursorHeader>),
+    >,
+    mut header_q: Query<
+        (&mut Text, &mut Visibility),
+        (
+            With<WatchGridCursorHeader>,
+            Without<WatchPosterTile>,
+            Without<WatchPosterTileTitle>,
+        ),
+    >,
 ) {
-    // Only fire on relevant changes — engine state (cursor moves) OR
-    // library snapshot (new entries / poster URLs) OR registry (download
-    // completion). The Bevy `is_changed` on a `Res<PosterRegistry>` only
-    // fires when the resource itself is replaced (never, here); we
-    // conservatively run every tick since the work is cheap (a single
-    // HashMap lookup + handle clone).
     let visible = matches!(engine_res.menu_level, MenuLevel::WatchSubmenu);
     if !visible {
-        for (_, mut vis) in q.iter_mut() {
+        for (_, mut vis, _) in tile_q.iter_mut() {
+            *vis = Visibility::Hidden;
+        }
+        for (_, mut vis, _) in title_q.iter_mut() {
+            *vis = Visibility::Hidden;
+        }
+        for (_, mut vis) in header_q.iter_mut() {
             *vis = Visibility::Hidden;
         }
         return;
     }
-    // Find the cursor entry's poster URL.
+
+    // Build a snapshot of windowed library entries — short lock scope.
+    struct SlotData {
+        title: String,
+        year: Option<u32>,
+        poster_url: Option<String>,
+    }
     let cursor = engine_res.submenu_cursor;
-    let poster_url = match library_snap.0.lock() {
-        Ok(s) if cursor < s.entries.len() => s.entries[cursor].poster_url.clone(),
-        _ => None,
+    let (slots, cursor_in_window, total) = match library_snap.0.lock() {
+        Ok(s) => {
+            let total = s.entries.len();
+            if total == 0 {
+                (Vec::new(), 0usize, 0)
+            } else {
+                // Window the cursor inside the WATCH_GRID_SLOTS visible
+                // set. Reuse window_around so the scroll behavior is the
+                // same shape as the prior text-list flow.
+                let (window_start, indices) = watch_ui::window_around(cursor, total);
+                let cursor_in_window = cursor.saturating_sub(window_start);
+                let data: Vec<SlotData> = indices
+                    .iter()
+                    .map(|&i| {
+                        let e = &s.entries[i];
+                        SlotData {
+                            title: e.display_name.clone(),
+                            year: e.year,
+                            poster_url: e.poster_url.clone(),
+                        }
+                    })
+                    .collect();
+                (data, cursor_in_window, total)
+            }
+        }
+        Err(_) => (Vec::new(), 0usize, 0),
     };
-    // Resolve URL → Handle via the registry. If not a Handle yet
-    // (Pending / Bytes / Failed / missing) we hide the preview.
-    let handle = match poster_url.as_deref() {
-        Some(url) => match registry.entries.lock() {
-            Ok(map) => match map.get(url) {
-                Some(posters::PosterStatus::Handle(h)) => Some(h.clone()),
-                _ => None,
-            },
-            Err(_) => None,
-        },
-        None => None,
-    };
-    for (mut image_node, mut vis) in q.iter_mut() {
-        match handle.clone() {
-            Some(h) => {
-                image_node.image = h;
+
+    // Cursor header — title + (year) if available.
+    if let Ok(mut map) = registry.entries.lock() {
+        // Touch nothing — we just need access guard pattern consistency;
+        // the actual handle lookup happens below.
+        let _ = &mut map;
+    }
+    let cursor_title = slots
+        .get(cursor_in_window)
+        .map(|s| match s.year {
+            Some(y) => format!("{} ({})", s.title, y),
+            None => s.title.clone(),
+        })
+        .unwrap_or_else(|| {
+            if total == 0 {
+                "(library loading…)".to_string()
+            } else {
+                String::new()
+            }
+        });
+    for (mut text, mut vis) in header_q.iter_mut() {
+        *vis = Visibility::Inherited;
+        if text.0 != cursor_title {
+            text.0 = cursor_title.clone();
+        }
+    }
+
+    // Update each tile based on its slot's library entry (if any).
+    let registry_guard = registry.entries.lock();
+    for (mut image_node, mut vis, tile) in tile_q.iter_mut() {
+        let slot_data = slots.get(tile.slot);
+        match slot_data {
+            Some(data) => {
                 *vis = Visibility::Inherited;
+                // Resolve poster URL → handle if available.
+                let handle = data
+                    .poster_url
+                    .as_deref()
+                    .and_then(|url| match &registry_guard {
+                        Ok(map) => match map.get(url) {
+                            Some(posters::PosterStatus::Handle(h)) => Some(h.clone()),
+                            _ => None,
+                        },
+                        Err(_) => None,
+                    });
+                if let Some(h) = handle {
+                    image_node.image = h;
+                }
+                // Cursor-tile highlight: full opacity. Non-cursor: dim.
+                let alpha = if tile.slot == cursor_in_window {
+                    1.0
+                } else {
+                    0.55
+                };
+                image_node.color = Color::srgba(1.0, 1.0, 1.0, alpha);
             }
             None => {
                 *vis = Visibility::Hidden;
             }
         }
+    }
+    drop(registry_guard);
+
+    // Update title labels under each tile.
+    for (mut text, mut vis, title_marker) in title_q.iter_mut() {
+        let slot_data = slots.get(title_marker.slot);
+        match slot_data {
+            Some(data) => {
+                *vis = Visibility::Inherited;
+                let label = if data.title.chars().count() > 22 {
+                    let mut s: String = data.title.chars().take(21).collect();
+                    s.push('…');
+                    s
+                } else {
+                    data.title.clone()
+                };
+                if text.0 != label {
+                    text.0 = label;
+                }
+            }
+            None => {
+                *vis = Visibility::Hidden;
+            }
+        }
+    }
+}
+
+fn watch_poster_preview_system(
+    _engine_res: Res<EngineRes>,
+    _library_snap: Res<watch_ui::LibrarySnapshotRes>,
+    _registry: Res<posters::PosterRegistry>,
+    mut q: Query<&mut Visibility, With<WatchPosterPreview>>,
+) {
+    // Phase 2B (2026-05-28) retired the single-poster preview pattern;
+    // the 5×2 grid (watch_poster_grid_system) is now the primary surface.
+    // The WatchPosterPreview entity stays spawned (hidden) so future
+    // "selected-poster zoom on B-hold" or similar interactions can
+    // re-purpose the slot without re-spawning setup.
+    for mut vis in q.iter_mut() {
+        *vis = Visibility::Hidden;
     }
 }
 
