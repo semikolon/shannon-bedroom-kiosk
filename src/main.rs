@@ -390,6 +390,21 @@ struct EngineRes {
     /// `SEEK_DEBOUNCE_MS` is 250 ms — blocks runaway autorepeat without
     /// blocking deliberate tap rhythms.
     last_seek_action_at: Option<std::time::Instant>,
+    /// Phase 5 (2026-05-29) — push-to-talk voice state. L1 hold fires
+    /// capture; transitions Idle → Listening → Pending(text) → Idle.
+    /// Visual confirm flow (per Fredrik's original TODO spec):
+    ///   Idle      L1 press → Listening (records + transcribes)
+    ///   Listening voice_poll_system sees result → Pending(text) | Idle
+    ///   Pending   A confirms → fires /watch + Idle
+    ///             L1 retries → restart capture + Listening
+    ///             B cancels → Idle
+    voice_state: VoiceState,
+    /// Phase 5 — thread-to-Bevy bridge for transcription results. The
+    /// std::thread spawned by `spawn_daemon_voice_transcribe` writes the
+    /// outcome here; `voice_poll_system` reads it each tick + updates
+    /// `voice_state`. Option-wraps the Result so 'None' means 'no new
+    /// result pending' (steady state once consumed).
+    voice_result_rx: Arc<Mutex<Option<Result<String, String>>>>,
     /// Timestamp of the last Music dispatch (POST /media → daemon HA
     /// `media_player.media_play_pause`). Separate debounce field from
     /// lights/watch — Music's HA round-trip is ~500 ms (audio backend
@@ -518,6 +533,8 @@ impl Default for EngineRes {
             last_seek_action_at: None,
             last_media_action_at: None,
             pending_watch: None,
+            voice_state: VoiceState::Idle,
+            voice_result_rx: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -566,6 +583,16 @@ struct LightsSubmenuLabel {
 /// based on EngineRes.pending_watch.
 #[derive(Component)]
 struct WatchPendingOverlay;
+
+/// Phase 5 (2026-05-29) — voice push-to-talk state machine. See
+/// `EngineRes::voice_state` for the lifecycle. Pending stores the
+/// transcribed text awaiting user A-confirm (or L1-retry / B-cancel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VoiceState {
+    Idle,
+    Listening,
+    Pending { text: String },
+}
 
 /// Now-Playing view (Phase-7 Phase 3+4, 2026-05-28) — full-screen surface
 /// showing the currently-playing stream's title + state + position.
@@ -924,6 +951,7 @@ fn main() {
                 ambient_render_system,
                 blackout_render_system,
                 state_badge_system,
+                voice_poll_system,
                 pending_watch_overlay_system,
                 now_playing_render_system,
                 music_now_playing_render_system,
@@ -1230,63 +1258,91 @@ fn try_dispatch_seek(
     true
 }
 
-/// Phase 5 (2026-05-29) — voice transcribe + auto-watch. Fires
-/// kiosk-actions `/transcribe` (which records 7s + posts to Mac Mini
-/// transcribe endpoint). On non-empty text → fires `/watch` with the
-/// transcribed text as the title. On empty text or error → logs only.
+/// Phase 5 (2026-05-29) — voice transcribe → write result to shared
+/// mutex. The kiosk's `voice_poll_system` picks the result up the next
+/// tick and transitions `EngineRes::voice_state` to `Pending{text}` (on
+/// success) or back to `Idle` (on empty/error). User then confirms with
+/// A → /watch, retries with L1 → restart, or cancels with B → Idle.
+/// Reactive-only spec per Fredrik's original TODO (B): visual confirm
+/// + ability to re-transcribe before auto-watch.
+///
 /// Fire-and-forget std::thread; total worst-case wall-clock ~20s
-/// (7s record + ~5-10s Deepgram + headroom). The pending_watch overlay
-/// already shows "Listening..." from the caller's POV.
-fn spawn_daemon_transcribe_and_watch(daemon_url: String) {
+/// (7s record + ~5-10s Deepgram + headroom). The voice overlay shows
+/// "Listening…" while this thread runs.
+fn spawn_daemon_voice_transcribe(
+    daemon_url: String,
+    rx: Arc<Mutex<Option<Result<String, String>>>>,
+) {
     let _ = std::thread::Builder::new()
         .name("daemon-post-transcribe".to_string())
         .spawn(move || {
-            let client = match reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(25))
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("daemon-post-transcribe: client build failed: {e}");
-                    return;
-                }
-            };
-            let url = format!("{}/transcribe", daemon_url.trim_end_matches('/'));
-            let resp = match client.post(&url).json(&serde_json::json!({})).send() {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("daemon POST {} failed: {}", url, e);
-                    return;
-                }
-            };
-            let status = resp.status();
-            let body: serde_json::Value = match resp.json() {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("daemon POST {} parse: {}", url, e);
-                    return;
-                }
-            };
-            info!("daemon POST {} → {} body={}", url, status, body);
-            let text = body
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim();
-            if text.is_empty() {
-                let err = body
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("empty transcription");
-                warn!("transcribe returned no usable text: {err}");
-                return;
+            let result = transcribe_once(&daemon_url);
+            if let Ok(mut slot) = rx.lock() {
+                *slot = Some(result);
+            } else {
+                warn!("voice_result_rx mutex poisoned; transcription dropped");
             }
-            // Chain into the same /watch path the menu uses. Reuse the
-            // existing watch dispatcher so debouncing, overlay, etc.,
-            // all behave identically.
-            info!("transcribe success → dispatching /watch title={:?}", text);
-            spawn_daemon_watch_post(daemon_url.clone(), text.to_string());
         });
+}
+
+fn transcribe_once(daemon_url: &str) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(25))
+        .build()
+        .map_err(|e| format!("client build: {e}"))?;
+    let url = format!("{}/transcribe", daemon_url.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({}))
+        .send()
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().map_err(|e| format!("parse {url}: {e}"))?;
+    info!("daemon POST {} → {} body={}", url, status, body);
+    if !status.is_success() {
+        let err = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("HTTP {status}: {err}"));
+    }
+    let text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return Err("empty transcription (silence or unrecognized)".to_string());
+    }
+    Ok(text)
+}
+
+/// Phase 5 — drain the voice_result_rx mutex each tick + update
+/// engine_res.voice_state. On success: Listening → Pending{text}; on
+/// failure: Listening → Idle (with a warn log). Steady-state cost is
+/// one mutex try_lock + a None check per tick.
+fn voice_poll_system(mut engine_res: ResMut<EngineRes>) {
+    // Only inspect during the relevant transition window — saves a
+    // mutex try_lock per tick when nothing is in flight.
+    if !matches!(engine_res.voice_state, VoiceState::Listening) {
+        return;
+    }
+    let taken = match engine_res.voice_result_rx.try_lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => return, // poisoned or contended; try again next tick
+    };
+    match taken {
+        Some(Ok(text)) => {
+            info!("voice_poll: transcription Pending text={:?}", text);
+            engine_res.voice_state = VoiceState::Pending { text };
+        }
+        Some(Err(e)) => {
+            warn!("voice_poll: transcription failed: {}", e);
+            engine_res.voice_state = VoiceState::Idle;
+        }
+        None => {}
+    }
 }
 
 /// Music tile (`MenuItem::Music`) debounce window. Caps the rate at
@@ -2267,21 +2323,36 @@ fn gamepad_event_system(
                 info!("Music NowPlaying: DPadRight = next");
                 try_dispatch_media(&mut engine_res, &daemon_url, MUSIC_DEFAULT_ENTITY, "next");
             }
-            // Phase 5 (2026-05-29) — voice search via L1 push-to-talk.
-            // Fires kiosk-actions /transcribe which records 7s from the
-            // bedroom mic, posts to Mac Mini's transcribe endpoint, and
-            // returns transcribed text. On success → fires the same
-            // /watch handler as the normal Watch flow with the text as
-            // the title. Active globally (any menu level): keeps the
-            // L1 affordance discoverable without view-gating.
-            // pending_watch overlay reuses the existing "STARTING <title>"
-            // surface for "Listening..." / "Transcribing..." feedback.
-            GamepadButton::LeftTrigger => {
-                info!("L1 (LeftTrigger) press → spawn voice transcribe + watch");
-                engine_res.pending_watch =
-                    Some(("Listening...".to_string(), std::time::Instant::now()));
-                spawn_daemon_transcribe_and_watch(daemon_url.0.clone());
-            }
+            // Phase 5 (2026-05-29) — voice search via L1 push-to-talk
+            // with visual confirm (per Fredrik's original TODO spec).
+            // L1 behavior:
+            //   Idle      → start capture (Listening); 7 s record + STT
+            //   Listening → no-op (capture in flight)
+            //   Pending   → restart capture (clears prior text, retry)
+            // voice_poll_system transitions Listening → Pending{text}
+            // on success or → Idle on empty/error. From Pending:
+            //   A confirms → /watch + Idle
+            //   B cancels  → Idle
+            //   L1 retries → restart capture (same arm as Idle)
+            GamepadButton::LeftTrigger => match engine_res.voice_state.clone() {
+                VoiceState::Listening => {
+                    info!("L1: ignored (already Listening)");
+                }
+                VoiceState::Idle | VoiceState::Pending { .. } => {
+                    info!("L1 → start voice capture");
+                    engine_res.voice_state = VoiceState::Listening;
+                    // Clear any prior pending result so the poll system
+                    // doesn't pick up a stale value before the new
+                    // capture finishes.
+                    if let Ok(mut slot) = engine_res.voice_result_rx.try_lock() {
+                        *slot = None;
+                    }
+                    spawn_daemon_voice_transcribe(
+                        daemon_url.0.clone(),
+                        engine_res.voice_result_rx.clone(),
+                    );
+                }
+            },
             // Phase 4 (2026-05-29) — NowPlaying transport controls. DPad-LR
             // seek ±SEEK_STEP_SECS via spela-renderer's IPC socket
             // (routed through kiosk-actions /seek). Active only when the
@@ -2304,6 +2375,25 @@ fn gamepad_event_system(
                     &daemon_url,
                     serde_json::json!({ "delta": SEEK_STEP_SECS as i64 }),
                 );
+            }
+            // Phase 5 (2026-05-29) — voice confirm short-circuit. When a
+            // transcription is Pending, A confirms (fires /watch with the
+            // text + clears voice_state) regardless of menu level. This
+            // pre-empts the menu A-handler below.
+            GamepadButton::South
+                if matches!(engine_res.voice_state, VoiceState::Pending { .. }) =>
+            {
+                let text = if let VoiceState::Pending { text } = engine_res.voice_state.clone() {
+                    text
+                } else {
+                    String::new()
+                };
+                info!("A confirms voice transcription → /watch {:?}", text);
+                engine_res.voice_state = VoiceState::Idle;
+                if !text.is_empty() {
+                    engine_res.pending_watch = Some((text.clone(), std::time::Instant::now()));
+                    try_dispatch_watch(&mut engine_res, &daemon_url, &text);
+                }
             }
             GamepadButton::South => match engine_res.menu_level {
                 MenuLevel::Root => {
@@ -2460,6 +2550,13 @@ fn gamepad_event_system(
                     );
                 }
             },
+            // Phase 5 — voice cancel short-circuit. When a transcription
+            // is Pending, B cancels (returns to Idle) regardless of
+            // menu level. Pre-empts the menu B-handler below.
+            GamepadButton::East if matches!(engine_res.voice_state, VoiceState::Pending { .. }) => {
+                info!("B cancels voice transcription");
+                engine_res.voice_state = VoiceState::Idle;
+            }
             GamepadButton::East => match engine_res.menu_level {
                 MenuLevel::Root => {
                     info!("Back (no-op at Root)");
@@ -3925,23 +4022,44 @@ fn pending_watch_overlay_system(
     mut q: Query<(&mut Visibility, Option<&mut Text>), With<WatchPendingOverlay>>,
 ) {
     let now = std::time::Instant::now();
-    let (visible, label) = match engine_res.pending_watch.as_ref() {
-        Some((title, t)) => {
-            if now.duration_since(*t).as_millis() > WATCH_OVERLAY_TIMEOUT_MS as u128 {
-                (false, None)
+    // Voice state takes precedence over watch-pending (the user is
+    // actively in the voice-confirm flow; the watch dispatch lives in
+    // the future after they confirm). Listening + Pending both render
+    // the same overlay surface as STARTING — single text label, no UI
+    // additions needed.
+    let voice_label: Option<String> = match &engine_res.voice_state {
+        VoiceState::Idle => None,
+        VoiceState::Listening => Some("LISTENING…".to_string()),
+        VoiceState::Pending { text } => {
+            let trimmed = if text.chars().count() > 48 {
+                let prefix: String = text.chars().take(47).collect();
+                format!("{prefix}…")
             } else {
-                // Truncate over-long release titles for the overlay so
-                // they don't overflow the 1120 px label width. The full
-                // title still went to spela-local via try_dispatch_watch.
-                let trimmed = if title.len() > 56 {
-                    format!("{}…", &title[..55])
-                } else {
-                    title.clone()
-                };
-                (true, Some(format!("STARTING {}…", trimmed)))
-            }
+                text.clone()
+            };
+            // Two lines: transcribed text + button hint. The overlay
+            // text supports newlines (Bevy Text renders multi-line).
+            Some(format!("“{trimmed}”\nA = watch · L1 = retry · B = cancel"))
         }
-        None => (false, None),
+    };
+    let (visible, label) = if let Some(v) = voice_label {
+        (true, Some(v))
+    } else {
+        match engine_res.pending_watch.as_ref() {
+            Some((title, t)) => {
+                if now.duration_since(*t).as_millis() > WATCH_OVERLAY_TIMEOUT_MS as u128 {
+                    (false, None)
+                } else {
+                    let trimmed = if title.len() > 56 {
+                        format!("{}…", &title[..55])
+                    } else {
+                        title.clone()
+                    };
+                    (true, Some(format!("STARTING {}…", trimmed)))
+                }
+            }
+            None => (false, None),
+        }
     };
 
     for (mut vis, text) in q.iter_mut() {
