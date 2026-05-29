@@ -105,6 +105,7 @@ async fn main() {
         .route("/media/:entity_key/:action", post(media_handler))
         .route("/watch", post(watch_handler))
         .route("/seek", post(seek_handler))
+        .route("/transcribe", post(transcribe_handler))
         .with_state(state);
 
     // Bind: default to LAN-accessible 0.0.0.0:8080 so the remote media
@@ -685,6 +686,80 @@ async fn seek_handler(Json(req): Json<SeekReq>) -> impl IntoResponse {
             Json(json!({ "error": format!("renderer ipc io: {e}") })),
         ),
     }
+}
+
+/// POST /transcribe — Phase 5 reactive voice search (2026-05-29).
+/// Spawns `shannon-voice-capture` as a subprocess (records mic, POSTs
+/// to Mac Mini transcribe endpoint, returns JSON). The JSON is parsed
+/// here and re-emitted to the caller (the kiosk Bevy app), or wrapped
+/// in an error envelope on failure.
+///
+/// Body: { "max_secs": 7 }   default 7 — push-to-talk window length
+/// Response: { "text": "...", "language": "...", ... } on success
+///           { "error": "...", ... }                  on failure
+async fn transcribe_handler(Json(req): Json<TranscribeReq>) -> impl IntoResponse {
+    let max_secs = req.max_secs.unwrap_or(7);
+    if !(1..=30).contains(&max_secs) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "max_secs must be in [1,30]" })),
+        );
+    }
+
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("shannon-voice-capture")
+            .arg(max_secs.to_string())
+            .stderr(std::process::Stdio::piped())
+            .output()
+    })
+    .await;
+    let output = match output {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("spawn shannon-voice-capture: {e}") })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("join_blocking: {e}") })),
+            );
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!("shannon-voice-capture exit={:?}", output.status.code()),
+                "stderr": stderr.trim_end(),
+                "stdout": stdout.trim_end(),
+            })),
+        );
+    }
+    // shannon-voice-capture writes JSON to stdout — pass through.
+    let body = String::from_utf8_lossy(&output.stdout).into_owned();
+    match serde_json::from_str::<Value>(body.trim()) {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!("parse capture output: {e}"),
+                "raw": body.trim(),
+            })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TranscribeReq {
+    /// Maximum recording window in seconds. Default 7 — covers a typical
+    /// "the boys season five" or "spela inception" phrase with margin.
+    /// Capped at 30 to bound resource use.
+    max_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1230,6 +1230,65 @@ fn try_dispatch_seek(
     true
 }
 
+/// Phase 5 (2026-05-29) — voice transcribe + auto-watch. Fires
+/// kiosk-actions `/transcribe` (which records 7s + posts to Mac Mini
+/// transcribe endpoint). On non-empty text → fires `/watch` with the
+/// transcribed text as the title. On empty text or error → logs only.
+/// Fire-and-forget std::thread; total worst-case wall-clock ~20s
+/// (7s record + ~5-10s Deepgram + headroom). The pending_watch overlay
+/// already shows "Listening..." from the caller's POV.
+fn spawn_daemon_transcribe_and_watch(daemon_url: String) {
+    let _ = std::thread::Builder::new()
+        .name("daemon-post-transcribe".to_string())
+        .spawn(move || {
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(25))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("daemon-post-transcribe: client build failed: {e}");
+                    return;
+                }
+            };
+            let url = format!("{}/transcribe", daemon_url.trim_end_matches('/'));
+            let resp = match client.post(&url).json(&serde_json::json!({})).send() {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("daemon POST {} failed: {}", url, e);
+                    return;
+                }
+            };
+            let status = resp.status();
+            let body: serde_json::Value = match resp.json() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("daemon POST {} parse: {}", url, e);
+                    return;
+                }
+            };
+            info!("daemon POST {} → {} body={}", url, status, body);
+            let text = body
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if text.is_empty() {
+                let err = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("empty transcription");
+                warn!("transcribe returned no usable text: {err}");
+                return;
+            }
+            // Chain into the same /watch path the menu uses. Reuse the
+            // existing watch dispatcher so debouncing, overlay, etc.,
+            // all behave identically.
+            info!("transcribe success → dispatching /watch title={:?}", text);
+            spawn_daemon_watch_post(daemon_url.clone(), text.to_string());
+        });
+}
+
 /// Music tile (`MenuItem::Music`) debounce window. Caps the rate at
 /// which the Music A-arm can fire daemon POSTs. HA's `media_player.*`
 /// services have ~500 ms response latency on the spotifyd Spotify-
@@ -2207,6 +2266,21 @@ fn gamepad_event_system(
             {
                 info!("Music NowPlaying: DPadRight = next");
                 try_dispatch_media(&mut engine_res, &daemon_url, MUSIC_DEFAULT_ENTITY, "next");
+            }
+            // Phase 5 (2026-05-29) — voice search via L1 push-to-talk.
+            // Fires kiosk-actions /transcribe which records 7s from the
+            // bedroom mic, posts to Mac Mini's transcribe endpoint, and
+            // returns transcribed text. On success → fires the same
+            // /watch handler as the normal Watch flow with the text as
+            // the title. Active globally (any menu level): keeps the
+            // L1 affordance discoverable without view-gating.
+            // pending_watch overlay reuses the existing "STARTING <title>"
+            // surface for "Listening..." / "Transcribing..." feedback.
+            GamepadButton::LeftTrigger => {
+                info!("L1 (LeftTrigger) press → spawn voice transcribe + watch");
+                engine_res.pending_watch =
+                    Some(("Listening...".to_string(), std::time::Instant::now()));
+                spawn_daemon_transcribe_and_watch(daemon_url.0.clone());
             }
             // Phase 4 (2026-05-29) — NowPlaying transport controls. DPad-LR
             // seek ±SEEK_STEP_SECS via spela-renderer's IPC socket
