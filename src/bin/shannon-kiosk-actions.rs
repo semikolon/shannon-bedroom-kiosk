@@ -106,6 +106,17 @@ async fn main() {
         .route("/watch", post(watch_handler))
         .route("/seek", post(seek_handler))
         .route("/transcribe", post(transcribe_handler))
+        .route("/audio/sinks", get(audio_sinks_handler))
+        .route(
+            "/audio/sink",
+            get(audio_sink_current_handler).post(audio_sink_set_handler),
+        )
+        .route("/bt/paired", get(bt_paired_handler))
+        .route("/bt/scan", post(bt_scan_handler))
+        .route("/bt/pair", post(bt_pair_handler))
+        .route("/bt/connect", post(bt_connect_handler))
+        .route("/bt/disconnect", post(bt_disconnect_handler))
+        .route("/bt/forget", post(bt_forget_handler))
         .with_state(state);
 
     // Bind: default to LAN-accessible 0.0.0.0:8080 so the remote media
@@ -752,6 +763,209 @@ async fn transcribe_handler(Json(req): Json<TranscribeReq>) -> impl IntoResponse
             })),
         ),
     }
+}
+
+// ─── Audio sink + Bluetooth routes — Phase-9 BT-audio (2026-05-29) ──────
+//
+// Thin wrappers over /usr/local/bin/shannon-audio-sink and /usr/local/bin/
+// shannon-bt-pair. Used by both the kiosk Sound submenu (via Bevy) and
+// directly by ssh/curl from the operator. Each handler shells out via
+// tokio::task::spawn_blocking — the CLI helpers are sub-second except
+// bt-scan (bounded by user-supplied secs param, capped at 30) and
+// bt-pair (typically 5-15s for the BlueZ pairing dance).
+
+async fn audio_sinks_handler() -> impl IntoResponse {
+    match run_capture(&["shannon-audio-sink", "list"]).await {
+        Ok(stdout) => {
+            let sinks: Vec<Value> = stdout
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| {
+                    let mut parts = l.splitn(3, '\t');
+                    let id = parts.next()?.trim();
+                    let name = parts.next()?.trim();
+                    let flag = parts.next().unwrap_or("").trim();
+                    Some(json!({
+                        "id": id,
+                        "name": name,
+                        "default": flag == "default",
+                    }))
+                })
+                .collect();
+            (StatusCode::OK, Json(json!({ "sinks": sinks })))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        ),
+    }
+}
+
+async fn audio_sink_current_handler() -> impl IntoResponse {
+    match run_capture(&["shannon-audio-sink", "current"]).await {
+        Ok(stdout) => {
+            let mut parts = stdout.trim().splitn(2, '\t');
+            let id = parts.next().unwrap_or("").to_string();
+            let name = parts.next().unwrap_or("").to_string();
+            (StatusCode::OK, Json(json!({ "id": id, "name": name })))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        ),
+    }
+}
+
+async fn audio_sink_set_handler(Json(req): Json<AudioSinkSetReq>) -> impl IntoResponse {
+    let cmd: Vec<String> = match (req.id, req.name) {
+        (Some(id), _) => vec!["shannon-audio-sink".into(), "set".into(), id],
+        (None, Some(name)) => vec!["shannon-audio-sink".into(), "set-name".into(), name],
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "specify 'id' or 'name'" })),
+            );
+        }
+    };
+    let args: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+    match run_capture(&args).await {
+        Ok(_) => (StatusCode::OK, Json(json!({ "status": "ok" }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        ),
+    }
+}
+
+async fn bt_paired_handler() -> impl IntoResponse {
+    match run_capture(&["shannon-bt-pair", "paired"]).await {
+        Ok(stdout) => {
+            let devices: Vec<Value> = stdout
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| {
+                    let mut parts = l.splitn(2, ' ');
+                    let mac = parts.next()?.trim();
+                    let name = parts.next().unwrap_or("").trim();
+                    Some(json!({ "mac": mac, "name": name }))
+                })
+                .collect();
+            (StatusCode::OK, Json(json!({ "devices": devices })))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        ),
+    }
+}
+
+async fn bt_scan_handler(Json(req): Json<BtScanReq>) -> impl IntoResponse {
+    let secs = req.secs.unwrap_or(15).clamp(3, 30).to_string();
+    match run_capture(&["shannon-bt-pair", "scan", &secs]).await {
+        Ok(stdout) => {
+            let devices: Vec<Value> = stdout
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| {
+                    let mut parts = l.splitn(2, ' ');
+                    let mac = parts.next()?.trim();
+                    let name = parts.next().unwrap_or("").trim();
+                    Some(json!({ "mac": mac, "name": name }))
+                })
+                .collect();
+            (StatusCode::OK, Json(json!({ "devices": devices })))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        ),
+    }
+}
+
+async fn bt_pair_handler(Json(req): Json<BtMacReq>) -> impl IntoResponse {
+    bt_simple(&req.mac, "pair").await
+}
+async fn bt_connect_handler(Json(req): Json<BtMacReq>) -> impl IntoResponse {
+    bt_simple(&req.mac, "connect").await
+}
+async fn bt_disconnect_handler(Json(req): Json<BtMacReq>) -> impl IntoResponse {
+    bt_simple(&req.mac, "disconnect").await
+}
+async fn bt_forget_handler(Json(req): Json<BtMacReq>) -> impl IntoResponse {
+    bt_simple(&req.mac, "forget").await
+}
+
+async fn bt_simple(mac: &str, action: &str) -> (StatusCode, Json<Value>) {
+    if !is_valid_mac(mac) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid MAC address format" })),
+        );
+    }
+    match run_capture(&["shannon-bt-pair", action, mac]).await {
+        Ok(stdout) => (
+            StatusCode::OK,
+            Json(json!({ "status": "ok", "stdout": stdout.trim_end() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        ),
+    }
+}
+
+fn is_valid_mac(s: &str) -> bool {
+    let s = s.trim();
+    if s.len() != 17 {
+        return false;
+    }
+    s.chars().enumerate().all(|(i, c)| {
+        if i % 3 == 2 {
+            c == ':'
+        } else {
+            c.is_ascii_hexdigit()
+        }
+    })
+}
+
+async fn run_capture(argv: &[&str]) -> Result<String, String> {
+    let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&owned[0]);
+        for a in &owned[1..] {
+            cmd.arg(a);
+        }
+        cmd.output()
+    })
+    .await
+    .map_err(|e| format!("join_blocking: {e}"))?
+    .map_err(|e| format!("spawn {}: {e}", argv[0]))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "{} exit={:?}: {}",
+            argv.join(" "),
+            out.status.code(),
+            stderr.trim_end()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[derive(Debug, Deserialize)]
+struct AudioSinkSetReq {
+    id: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BtScanReq {
+    secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BtMacReq {
+    mac: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -578,9 +578,20 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let audio_device = args
-        .next()
-        .unwrap_or_else(|| "plughw:CARD=hdmisound,DEV=0".to_string());
+    // Audio device resolution (precedence high → low):
+    //   1. argv[2] CLI arg (explicit override)
+    //   2. $SHANNON_AUDIO_DEVICE env var
+    //   3. "default" — PipeWire-routed ALSA default, follows wpctl
+    //      set-default. The historical hardcoded value
+    //      "plughw:CARD=hdmisound,DEV=0" was direct HDMI; switching to
+    //      "default" lets sink-switching (kiosk Sound menu / shannon-
+    //      audio-sink CLI) reroute spela playback to Bluetooth speakers
+    //      etc. spela-local sets PIPEWIRE_RUNTIME_DIR=/run/user/0 so
+    //      the ALSA-PipeWire bridge finds the root user PipeWire socket
+    //      from inside cage's scoped XDG_RUNTIME_DIR.
+    let audio_device = args.next().unwrap_or_else(|| {
+        env::var("SHANNON_AUDIO_DEVICE").unwrap_or_else(|_| "default".to_string())
+    });
 
     if let Err(e) = gst::init() {
         eprintln!("[spela-renderer] gst::init failed: {e}");
