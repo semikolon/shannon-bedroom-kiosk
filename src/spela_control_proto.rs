@@ -24,6 +24,10 @@ pub enum Command {
     SeekRelative(i64),
     /// Seek to absolute N seconds from stream start.
     SeekAbsolute(u64),
+    /// Toggle play/pause. Phase 4 (2026-05-29): when paused, the
+    /// pipeline is in `Paused` GStreamer state — frame is held, audio
+    /// is silent, position freezes. Next `PlayPause` resumes.
+    PlayPause,
     /// Stop pipeline gracefully + exit.
     Quit,
 }
@@ -60,6 +64,7 @@ pub fn parse_command(line: &str) -> Result<Option<Command>, String> {
                 .map_err(|e| format!("seek_absolute: parse seconds '{arg}': {e}"))?;
             Ok(Some(Command::SeekAbsolute(n)))
         }
+        "play_pause" => Ok(Some(Command::PlayPause)),
         "quit" => Ok(Some(Command::Quit)),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -120,6 +125,18 @@ mod tests {
     #[test]
     fn parse_quit() {
         assert_eq!(parse_command("quit").unwrap(), Some(Command::Quit));
+    }
+
+    #[test]
+    fn parse_play_pause() {
+        assert_eq!(
+            parse_command("play_pause").unwrap(),
+            Some(Command::PlayPause)
+        );
+        assert_eq!(
+            parse_command("play_pause\n").unwrap(),
+            Some(Command::PlayPause)
+        );
     }
 
     #[test]

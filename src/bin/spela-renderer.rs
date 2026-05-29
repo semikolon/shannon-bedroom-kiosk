@@ -80,15 +80,30 @@ use shannon_kiosk::spela_control_proto::{parse_command, Command};
 fn build_pipeline(hls_url: &str, audio_device: &str) -> Result<gst::Pipeline, String> {
     let pipeline = gst::Pipeline::with_name("spela-renderer");
 
-    // Source: HTTP HLS via souphttpsrc → hlsdemux → tsdemux. Use the
-    // LEGACY hlsdemux (NOT hlsdemux2) — hlsdemux2 requires the
-    // GST_BIN_FLAG_STREAMS_AWARE which only playbin3/decodebin3 set,
-    // and a hand-built bin can't satisfy. The legacy element has no
-    // such constraint and is what spela-local empirically uses.
-    let souphttpsrc = gst::ElementFactory::make("souphttpsrc")
+    // Source: HTTP HLS via curlhttpsrc (preferred, libcurl backend with
+    // better connection-reuse + HTTP/1.1 keep-alive across segments) →
+    // hlsdemux → tsdemux. Falls back to souphttpsrc if curlhttpsrc is
+    // unavailable (older GStreamer installs). Use the LEGACY hlsdemux
+    // (NOT hlsdemux2) — hlsdemux2 requires the GST_BIN_FLAG_STREAMS_AWARE
+    // which only playbin3/decodebin3 set, and a hand-built bin can't
+    // satisfy. The legacy element has no such constraint.
+    let http_src = match gst::ElementFactory::make("curlhttpsrc")
         .property("location", hls_url)
         .build()
-        .map_err(|e| format!("make souphttpsrc: {e}"))?;
+    {
+        Ok(el) => {
+            eprintln!("[spela-renderer] HTTP source: curlhttpsrc");
+            el
+        }
+        Err(_) => {
+            eprintln!("[spela-renderer] curlhttpsrc unavailable, using souphttpsrc");
+            gst::ElementFactory::make("souphttpsrc")
+                .property("location", hls_url)
+                .build()
+                .map_err(|e| format!("make souphttpsrc: {e}"))?
+        }
+    };
+    let souphttpsrc = http_src;
     let hlsdemux = gst::ElementFactory::make("hlsdemux").build().map_err(|e| {
         format!("make hlsdemux (legacy needed; hlsdemux2 won't work in a plain bin): {e}")
     })?;
@@ -307,6 +322,24 @@ fn apply_command(
                 .map_err(|e| format!("seek_simple: {e}"))?;
             Ok(secs)
         }
+        Command::PlayPause => {
+            // Toggle Paused ↔ Playing. Use the pipeline's CURRENT state
+            // as the truth (set_state target is a one-shot; we want a
+            // toggle relative to where the pipeline actually is now).
+            let (_, current, _) = pipeline.state(Some(gst::ClockTime::ZERO));
+            let target = match current {
+                gst::State::Playing => gst::State::Paused,
+                _ => gst::State::Playing,
+            };
+            pipeline
+                .set_state(target)
+                .map_err(|e| format!("set_state({target:?}): {e}"))?;
+            let pos = pipeline
+                .query_position::<gst::ClockTime>()
+                .map(|t| t.seconds())
+                .unwrap_or(0);
+            Ok(pos)
+        }
         Command::Quit => {
             if let Ok(mut q) = quit_signal.lock() {
                 *q = true;
@@ -413,6 +446,76 @@ fn handle_connection(
     let _ = writer.write_all(response.as_bytes());
 }
 
+/// Phase 4 (2026-05-29) — Xbox controller listener for during-playback
+/// transport control. The kiosk Bevy app is killed during spela-local
+/// playback (shannon-display.service stopped for scanout handoff), so
+/// the kiosk's gilrs handler is offline. We open a SECOND gilrs
+/// instance here that runs while playback is active and applies
+/// commands directly to the pipeline (skipping the Unix socket
+/// round-trip the kiosk uses during cold-start).
+///
+/// Button map:
+///   DPad-Left  → seek -SEEK_STEP_SECS
+///   DPad-Right → seek +SEEK_STEP_SECS
+///   West (X)   → seek_absolute 0 (restart from start)
+///   South (A)  → play_pause
+///   East (B)   → quit (returns to kiosk via spela-local's trap EXIT)
+///
+/// Failure-soft: a gilrs init failure logs and skips the listener;
+/// playback proceeds without controller input (caller can still use
+/// the Unix socket from another process).
+const SEEK_STEP_SECS: i64 = 30;
+
+fn spawn_controller_listener(
+    pipeline: Arc<Mutex<gst::Pipeline>>,
+    quit_signal: Arc<Mutex<bool>>,
+) -> Result<(), String> {
+    use gilrs::{Button, EventType, Gilrs};
+    let mut gilrs = Gilrs::new().map_err(|e| format!("gilrs init: {e}"))?;
+    eprintln!(
+        "[spela-renderer] controller listener spawned ({} gamepad(s) connected)",
+        gilrs.gamepads().count()
+    );
+    thread::Builder::new()
+        .name("spela-renderer-controller".to_string())
+        .spawn(move || {
+            loop {
+                if quit_signal.lock().map(|q| *q).unwrap_or(false) {
+                    break;
+                }
+                while let Some(event) = gilrs.next_event() {
+                    let EventType::ButtonPressed(button, _) = event.event else {
+                        continue;
+                    };
+                    let cmd = match button {
+                        Button::DPadLeft => Some(Command::SeekRelative(-SEEK_STEP_SECS)),
+                        Button::DPadRight => Some(Command::SeekRelative(SEEK_STEP_SECS)),
+                        Button::West => Some(Command::SeekAbsolute(0)),
+                        Button::South => Some(Command::PlayPause),
+                        Button::East => Some(Command::Quit),
+                        _ => None,
+                    };
+                    if let Some(cmd) = cmd {
+                        let result = match pipeline.lock() {
+                            Ok(p) => apply_command(cmd, &p, &quit_signal),
+                            Err(e) => Err(format!("pipeline lock poisoned: {e}")),
+                        };
+                        match result {
+                            Ok(pos) => {
+                                eprintln!("[spela-renderer] controller {cmd:?} → ok pos={pos}")
+                            }
+                            Err(e) => eprintln!("[spela-renderer] controller {cmd:?} → err {e}"),
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            eprintln!("[spela-renderer] controller listener exiting");
+        })
+        .map_err(|e| format!("spawn controller listener: {e}"))?;
+    Ok(())
+}
+
 /// Walk the GStreamer bus until EOS or a fatal Error. Returns Ok(()) on
 /// clean EOS; Err(msg) on pipeline error. State-changed messages from
 /// non-pipeline elements are ignored.
@@ -512,6 +615,13 @@ fn main() -> ExitCode {
         socket_path.clone(),
     ) {
         eprintln!("[spela-renderer] control listener disabled: {e}");
+    }
+
+    // Phase 4 (2026-05-29) — Xbox controller listener for direct
+    // during-playback control. Soft-failure: log + continue if gilrs
+    // init fails (no controller plugged in / udev missing / etc.).
+    if let Err(e) = spawn_controller_listener(pipeline_arc.clone(), quit_signal.clone()) {
+        eprintln!("[spela-renderer] controller listener disabled: {e}");
     }
 
     let result = run_until_eos(&pipeline, &quit_signal);
