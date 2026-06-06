@@ -247,6 +247,12 @@ enum MenuLevel {
     /// B=back to Root, Y=ForceOff. Manual nav Root→Music with music
     /// playing also routes here for unified UX.
     MusicNowPlaying,
+    /// Games tile submenu (2026-06-06): static 2-entry list. SuperTuxKart
+    /// launches directly via SDL2 kmsdrm. RetroArch entry boots into the
+    /// main RGUI menu (no -L core, no ROM) where the user browses cores +
+    /// ROMs with the Xbox controller. shannon-games handles cage handoff
+    /// (stop display service → game → restart on cleanup-trap exit).
+    GamesSubmenu,
 }
 
 struct SubmenuTile {
@@ -294,11 +300,28 @@ const MUSIC_SUBMENU: &[SubmenuTile] = &[
     },
 ];
 
+const GAMES_SUBMENU: &[SubmenuTile] = &[
+    SubmenuTile {
+        // key matches `shannon-games <key>` subcommand AND the daemon's
+        // /game/<key> route allowlist (stk + retroarch only — ROM-requiring
+        // subcommands need a ROM-list view we haven't built yet).
+        key: "stk",
+        label: "SUPERTUXKART",
+        icon: ICON_GAMES,
+    },
+    SubmenuTile {
+        key: "retroarch",
+        label: "RETROARCH",
+        icon: ICON_GAMES,
+    },
+];
+
 fn submenu_for(level: MenuLevel) -> &'static [SubmenuTile] {
     match level {
         MenuLevel::Root => &[],
         MenuLevel::LightsSubmenu => LIGHTS_SUBMENU,
         MenuLevel::MusicSubmenu => MUSIC_SUBMENU,
+        MenuLevel::GamesSubmenu => GAMES_SUBMENU,
         // WatchSubmenu has DYNAMIC content from watch_ui::LibrarySnapshotRes.
         // menu_render_system + gamepad_event_system special-case this variant
         // to read the library snapshot instead of this static slice.
@@ -411,6 +434,16 @@ struct EngineRes {
     /// has its own response latency); rapid A-presses on the Music tile
     /// would race the play↔pause flip. `MUSIC_DEBOUNCE_MS` matches.
     last_media_action_at: Option<std::time::Instant>,
+    /// Phase-6 Games (2026-06-06) — timestamp of the last /game/<name>
+    /// dispatch. Separate debounce field with a HIGH window (`GAMES_DEBOUNCE_MS`
+    /// = 2 s) because launching a game is the heaviest action in the kiosk:
+    /// shannon-games stops shannon-display.service (kills cage), then exec's
+    /// the game with kmsdrm/SDL2 direct rendering. A double-tap during the
+    /// 1-2 s display-service teardown could race the cage shutdown (one A-
+    /// press launches, the trailing one tries to launch again before the
+    /// first game has even taken DRM master). 2 s is generous; users will
+    /// adapt to the heavier-than-lights cadence.
+    last_games_action_at: Option<std::time::Instant>,
     /// Slice 1.5 (2026-05-24 evening user TV-test fix): the title of
     /// the last successfully-dispatched Watch entry + when it was
     /// dispatched. Drives `pending_watch_overlay_system`, which paints
@@ -532,6 +565,7 @@ impl Default for EngineRes {
             last_watch_action_at: None,
             last_seek_action_at: None,
             last_media_action_at: None,
+            last_games_action_at: None,
             pending_watch: None,
             voice_state: VoiceState::Idle,
             voice_result_rx: Arc::new(Mutex::new(None)),
@@ -1423,6 +1457,53 @@ fn try_dispatch_media(
     true
 }
 
+/// Phase-6 Games dispatch (2026-06-06). High debounce because launching
+/// a game is heavy (stops shannon-display.service + exec's a fullscreen
+/// kmsdrm app); double-taps during the 1-2 s display-service teardown
+/// would race the cage shutdown. 2 s gate matches the GAMES_DEBOUNCE_MS
+/// constant. Daemon-side spawn is fire-and-forget — the HTTP request
+/// returns 202 Accepted before the game starts; the script's own
+/// cleanup trap restores the display when the game exits.
+const GAMES_DEBOUNCE_MS: u64 = 2000;
+
+fn spawn_daemon_game_post(daemon_url: String, name: String) {
+    let result = std::thread::Builder::new()
+        .name(format!("daemon-post-game-{name}"))
+        .spawn(move || {
+            let url = format!("{}/game/{}", daemon_url.trim_end_matches('/'), name);
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("daemon-post-game: client build failed: {e}");
+                    return;
+                }
+            };
+            match client.post(&url).send() {
+                Ok(resp) => info!("daemon POST {} → {}", url, resp.status()),
+                Err(e) => warn!("daemon POST {} failed: {}", url, e),
+            }
+        });
+    if let Err(e) = result {
+        warn!("daemon-post-game: thread spawn failed (resource limit?): {e}");
+    }
+}
+
+fn try_dispatch_game(engine_res: &mut EngineRes, daemon_url: &DaemonUrl, name: &str) -> bool {
+    let now = std::time::Instant::now();
+    if let Some(last) = engine_res.last_games_action_at {
+        if now.duration_since(last) < Duration::from_millis(GAMES_DEBOUNCE_MS) {
+            info!("game {} throttled (rapid press)", name);
+            return false;
+        }
+    }
+    engine_res.last_games_action_at = Some(now);
+    spawn_daemon_game_post(daemon_url.0.clone(), name.to_string());
+    true
+}
+
 fn setup_background(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
 
@@ -1571,6 +1652,7 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
     let submenu_slots = LIGHTS_SUBMENU
         .len()
         .max(MUSIC_SUBMENU.len())
+        .max(GAMES_SUBMENU.len())
         .max(watch_ui::WATCH_VISIBLE_SLOTS);
     for i in 0..submenu_slots {
         let sub = LIGHTS_SUBMENU.get(i).unwrap_or(&LIGHTS_SUBMENU[0]);
@@ -2474,13 +2556,25 @@ fn gamepad_event_system(
                             cursor_idx = 0;
                             info!("Enter WatchSubmenu (library browse)");
                         }
-                        // Other tiles (Games, Buses, Sensors): South-arm
-                        // wiring pending per the kiosk plan's tile-
-                        // action roadmap. Games = RetroArch launch
-                        // (needs cage process-model research, mode-
-                        // script + daemon /mode/{m} route; design hub
-                        // §13.29); Sensors/Buses = native Sarpetorp
-                        // dashboard mirrors (render-system work).
+                        MenuItem::Games => {
+                            // 2026-06-06: A on GAMES opens GamesSubmenu —
+                            // a static 2-entry list (SuperTuxKart + RetroArch
+                            // main menu). RetroArch entry boots into RGUI
+                            // where the user picks cores + ROMs with the
+                            // controller. shannon-games script handles the
+                            // cage handoff (stops shannon-display.service,
+                            // launches game with kmsdrm direct rendering,
+                            // restarts display on cleanup-trap exit).
+                            engine_res.menu_level = MenuLevel::GamesSubmenu;
+                            engine_res.submenu_cursor = 0;
+                            cursor_idx = 0;
+                            info!("Enter GamesSubmenu (cursor=0=stk)");
+                        }
+                        // Other tiles (Sensors, Buses): South-arm wiring
+                        // pending — Sensors/Buses are preview-only today
+                        // (preview pane shows snapshot data; A-press is
+                        // a no-op). Roadmap: native Sarpetorp dashboard
+                        // mirrors (render-system work in the kiosk plan).
                         _ => {}
                     }
                 }
@@ -2495,6 +2589,18 @@ fn gamepad_event_system(
                     let action = MUSIC_SUBMENU[cursor_idx].key;
                     info!("Music: {} ({})", action, MUSIC_DEFAULT_ENTITY);
                     try_dispatch_media(&mut engine_res, &daemon_url, MUSIC_DEFAULT_ENTITY, action);
+                }
+                MenuLevel::GamesSubmenu => {
+                    // A on a games entry dispatches its key (e.g. "stk",
+                    // "retroarch") to the daemon's /game/<name> route,
+                    // which exec's shannon-games as a detached subprocess.
+                    // Debounced via try_dispatch_game (slow window — game
+                    // launches stop shannon-display.service, so a double
+                    // tap could race the cage shutdown). The script's own
+                    // cleanup trap restores the display on game exit.
+                    let game = GAMES_SUBMENU[cursor_idx].key;
+                    info!("Launch game: {}", game);
+                    try_dispatch_game(&mut engine_res, &daemon_url, game);
                 }
                 MenuLevel::WatchSubmenu => {
                     // A on a library entry dispatches its raw_name via the
@@ -2573,6 +2679,12 @@ fn gamepad_event_system(
                     engine_res.menu_level = MenuLevel::Root;
                     engine_res.cursor = MenuItem::Music;
                     cursor_idx = menu_index_of(MenuItem::Music);
+                }
+                MenuLevel::GamesSubmenu => {
+                    info!("Exit GamesSubmenu → Root (cursor restored to Games)");
+                    engine_res.menu_level = MenuLevel::Root;
+                    engine_res.cursor = MenuItem::Games;
+                    cursor_idx = menu_index_of(MenuItem::Games);
                 }
                 MenuLevel::WatchSubmenu => {
                     info!("Exit WatchSubmenu → Root (cursor restored to Watch)");
@@ -2661,9 +2773,10 @@ fn gamepad_event_system(
     // Write back the final cursor to the level-appropriate field.
     match engine_res.menu_level {
         MenuLevel::Root => engine_res.cursor = MENU[cursor_idx].item,
-        MenuLevel::LightsSubmenu | MenuLevel::MusicSubmenu | MenuLevel::WatchSubmenu => {
-            engine_res.submenu_cursor = cursor_idx
-        }
+        MenuLevel::LightsSubmenu
+        | MenuLevel::MusicSubmenu
+        | MenuLevel::WatchSubmenu
+        | MenuLevel::GamesSubmenu => engine_res.submenu_cursor = cursor_idx,
         // NowPlaying has no list to navigate (n=1, cursor_idx always 0),
         // so the cursor write is a no-op. Don't touch submenu_cursor
         // either — it's preserved during the WatchSubmenu→NowPlaying

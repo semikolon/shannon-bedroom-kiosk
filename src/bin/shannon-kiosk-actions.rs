@@ -105,6 +105,7 @@ async fn main() {
         .route("/media/:entity_key/:action", post(media_handler))
         .route("/watch", post(watch_handler))
         .route("/seek", post(seek_handler))
+        .route("/game/:name", post(game_handler))
         .route("/transcribe", post(transcribe_handler))
         .route("/audio/sinks", get(audio_sinks_handler))
         .route(
@@ -695,6 +696,50 @@ async fn seek_handler(Json(req): Json<SeekReq>) -> impl IntoResponse {
         Err(SeekError::Io(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("renderer ipc io: {e}") })),
+        ),
+    }
+}
+
+/// POST /game/:name — Phase-6 Games tile (2026-06-06). Launches the
+/// `shannon-games <name>` script as a detached subprocess. The script
+/// stops shannon-display.service (releases /dev/dri/card0 DRM master so
+/// the game can take fullscreen control), exec's the game with kmsdrm
+/// rendering, then restarts the display service on its EXIT trap when
+/// the game exits.
+///
+/// Allowlist: only "stk" (SuperTuxKart) and "retroarch" (RetroArch main
+/// menu) — these match the GamesSubmenu entries in the kiosk. The script
+/// also supports "snes <ROM>" and "gba <ROM>" but those need a ROM-list
+/// view we haven't built yet; gating them here keeps the surface area
+/// minimal until that lands.
+///
+/// Returns 202 Accepted immediately (game-launch is long-lived; daemon
+/// must not block the HTTP request on the game session).
+async fn game_handler(Path(name): Path<String>) -> impl IntoResponse {
+    let allowed = matches!(name.as_str(), "stk" | "retroarch");
+    if !allowed {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("unknown game: {}", name),
+                "allowed": ["stk", "retroarch"],
+            })),
+        );
+    }
+    match std::process::Command::new("/usr/local/bin/shannon-games")
+        .arg(&name)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "ok": true, "game": name })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("spawn failed: {}", e) })),
         ),
     }
 }
