@@ -197,14 +197,20 @@ fn build_pipeline(hls_url: &str, audio_device: &str) -> Result<gst::Pipeline, St
         ])
         .map_err(|e| format!("add sink elements: {e}"))?;
 
-    // Static linkage. tsdemux's output pads are dynamic — wired in the
-    // pad-added callback below.
+    // Static linkage where the source pad exists at construction time
+    // (souphttpsrc → hlsdemux). hlsdemux AND tsdemux both produce
+    // DYNAMIC pads — the hlsdemux → tsdemux link needs the pad-added
+    // signal pattern just like tsdemux → queues does. 2026-06-09: the
+    // prior `hlsdemux.link(&tsdemux)` failed with
+    // "Failed to link elements 'hlsdemux0' and 'tsdemux0'" because
+    // hlsdemux has zero source pads at construction time; they
+    // materialize at runtime when the HLS playlist parser detects
+    // the muxed-TS stream variant. This silent build_pipeline failure
+    // is the reason spela-renderer always fell back to v4 gst-launch
+    // (gst-launch's `!` operator handles dynamic pads invisibly).
     souphttpsrc
         .link(&hlsdemux)
         .map_err(|e| format!("link souphttpsrc→hlsdemux: {e}"))?;
-    hlsdemux
-        .link(&tsdemux)
-        .map_err(|e| format!("link hlsdemux→tsdemux: {e}"))?;
     gst::Element::link_many([&video_queue, &h264parse, &v4l2dec, &waylandsink])
         .map_err(|e| format!("link video chain: {e}"))?;
     gst::Element::link_many([
@@ -216,6 +222,23 @@ fn build_pipeline(hls_url: &str, audio_device: &str) -> Result<gst::Pipeline, St
         &alsasink,
     ])
     .map_err(|e| format!("link audio chain: {e}"))?;
+
+    // hlsdemux → tsdemux pad-added wiring. hlsdemux emits one source
+    // pad per stream variant (typically just one for HLS-on-MPEG-TS);
+    // its caps will be `video/mpegts` for the muxed stream which is
+    // the right input shape for tsdemux. is_linked() guards keep this
+    // idempotent across stream-restart re-pad events.
+    let tsdemux_for_hls_pad = tsdemux.clone();
+    hlsdemux.connect_pad_added(move |_demux, src_pad| {
+        let sink_pad = match tsdemux_for_hls_pad.static_pad("sink") {
+            Some(p) => p,
+            None => return,
+        };
+        if sink_pad.is_linked() {
+            return;
+        }
+        let _ = src_pad.link(&sink_pad);
+    });
 
     // Pad-added signal — THE reason we're in Rust rather than
     // gst-launch. tsdemux produces dynamic output pads as it parses
