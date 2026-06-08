@@ -473,10 +473,17 @@ async fn lights_handler(
             // Reuse the AppState http client (already shared with other
             // handlers); a short timeout because lights-daemon should
             // respond in <1s.
+            // 2026-06-08: raised 8s → 30s after BrokenPipeError surfaced
+            // in shannon-lights-daemon when bedroom-group toggles took
+            // longer than the 8s ceiling (an unavailable group member
+            // like light.closet_closet adds a Tuya cloud retry stall).
+            // The daemon completes the work fine; the client was just
+            // disconnecting prematurely. 30s covers worst-case Tuya-
+            // cloud per-device timeouts with retries.
             let req = s
                 .http
                 .post(&daemon_url)
-                .timeout(std::time::Duration::from_secs(8));
+                .timeout(std::time::Duration::from_secs(30));
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();

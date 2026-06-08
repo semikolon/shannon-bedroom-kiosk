@@ -716,8 +716,7 @@ enum MusicNowPlayingElement {
     Hint,
 }
 
-#[derive(Component)]
-struct StateBadge;
+// StateBadge: removed 2026-06-08 (state visible in preview-pane content)
 
 /// Marker for the resume-offer ribbon text (Slice 3e). One line above
 /// the controller chrome bar; visibility flips on/off per the engine's
@@ -984,7 +983,6 @@ fn main() {
                 ribbon_render_system,
                 ambient_render_system,
                 blackout_render_system,
-                state_badge_system,
                 voice_poll_system,
                 pending_watch_overlay_system,
                 now_playing_render_system,
@@ -1603,8 +1601,12 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
     // text-color contrast is sufficient to indicate selection. The
     // MenuCursorMarker type stays around (menu_render_system still
     // queries it; the empty iter just no-ops).
+    // 2026-06-08: shifted menu+submenu+chrome+ribbon up 30px after
+    // bedroom-TV photo showed the button legend too close to the
+    // bottom edge. y_start 240→210, chrome 905→875, ribbon 965→935 —
+    // gaps between menu/ribbon/chrome preserved.
     for (i, tile) in MENU.iter().enumerate() {
-        let y = 240.0 + (i as f32 * 88.0);
+        let y = 210.0 + (i as f32 * 88.0);
         let label_color = menu_color(i, i == 0);
 
         // Lucide icon
@@ -1656,7 +1658,7 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         .max(watch_ui::WATCH_VISIBLE_SLOTS);
     for i in 0..submenu_slots {
         let sub = LIGHTS_SUBMENU.get(i).unwrap_or(&LIGHTS_SUBMENU[0]);
-        let y = 240.0 + (i as f32 * 88.0);
+        let y = 210.0 + (i as f32 * 88.0);
         commands.spawn((
             Text::new(sub.icon.to_string()),
             TextFont {
@@ -1805,7 +1807,7 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         ("X", "LIGHTS", OAT_DIM),
         ("Y", "ALL OFF", OAT_DIM),
     ];
-    let chrome_y_start = 905.0;
+    let chrome_y_start = 875.0;
     let chrome_row_gap = 42.0;
     let chrome_glyph_x = 130.0;
     let chrome_label_x = 175.0;
@@ -1863,7 +1865,7 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         TextLayout::new_with_justify(Justify::Center),
         Node {
             position_type: PositionType::Absolute,
-            top: Val::Px(965.0), // just above chrome (chrome_y=1010)
+            top: Val::Px(935.0), // just above chrome (chrome_y_start=875)
             left: Val::Px(0.0),
             right: Val::Px(0.0),
             ..default()
@@ -1912,37 +1914,27 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         BlackoutOverlay,
     ));
 
-    // Engine state badge (top-right) — useful for dev iteration to see
-    // the engine in action. May be removed once the preview pane's
-    // content fully signals the engine state contextually.
-    commands.spawn((
-        Text::new("—"),
-        TextFont {
-            font: fonts.semibold.clone(),
-            font_size: 18.0,
-            ..default()
-        },
-        TextColor(OAT_FAINT),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(30.0),
-            right: Val::Px(40.0),
-            ..default()
-        },
-        StateBadge,
-    ));
+    // (2026-06-08: engine state badge removed per Fredrik — once the
+    // preview pane's content signals the engine state contextually,
+    // the corner badge became visual noise. StateBadge struct +
+    // state_badge_system also deleted.)
 
     // ─── Slice 1.5: Watch-dispatch "STARTING <title>..." overlay ──────
     // Spawned hidden; pending_watch_overlay_system flips visibility +
     // updates text from EngineRes.pending_watch. Positioned at the
     // vertical+horizontal center of the 1920×1080 kiosk canvas, with
     // a translucent dark backing card so it reads against any scene.
+    // 2026-06-08: x positions raised past SIDEBAR_WIDTH (540) so the
+    // pending-watch overlay no longer overlaps the wood-panel sidebar.
+    // Photo IMG_1558 showed "STARTING Spring (2014)..." rendering under
+    // the GAMES/MUSIC/LIGHTS tiles. Backing card and text now share the
+    // same right-pane offset as NowPlaying + the preview pane.
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
             top: Val::Px(440.0),
-            left: Val::Px(360.0),
-            width: Val::Px(1200.0),
+            left: Val::Px(SIDEBAR_WIDTH + 30.0),
+            width: Val::Px(1300.0),
             height: Val::Px(200.0),
             padding: UiRect::all(Val::Px(40.0)),
             ..default()
@@ -1963,8 +1955,8 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
         Node {
             position_type: PositionType::Absolute,
             top: Val::Px(490.0),
-            left: Val::Px(400.0),
-            width: Val::Px(1120.0),
+            left: Val::Px(SIDEBAR_WIDTH + 70.0),
+            width: Val::Px(1220.0),
             ..default()
         },
         Visibility::Hidden,
@@ -2714,6 +2706,11 @@ fn gamepad_event_system(
                 }
             },
             GamepadButton::North => {
+                // Y stays engine-only per the May 21 2026 design decision
+                // (commit 4d60ab1: "Y stays the engine-only emergency-off
+                // (cheaper recovery if you only want TV blackout without
+                // touching lights)"). Sleep tile (A on Sleep) is the
+                // lights+engine path.
                 engine_res.manual_press = Some(Manual::ForceOff);
                 info!("ALL OFF (engine ForceOff)");
             }
@@ -4159,7 +4156,17 @@ fn pending_watch_overlay_system(
             Some(format!("“{trimmed}”\nA = watch · L1 = retry · B = cancel"))
         }
     };
-    let (visible, label) = if let Some(v) = voice_label {
+    // 2026-06-08: once we're inside the NowPlaying view, the
+    // STARTING-overlay is redundant + visually conflicts (photo
+    // IMG_1558 showed "STARTING Spring (2014)…" rendering on top
+    // of the NowPlaying title "Send Help" + status "✕ PROCESS DEAD"
+    // simultaneously). NowPlaying is the canonical surface once the
+    // stream takes over; hide the pending overlay regardless of
+    // its timeout.
+    let in_now_playing = matches!(engine_res.menu_level, MenuLevel::NowPlaying);
+    let (visible, label) = if in_now_playing {
+        (false, None)
+    } else if let Some(v) = voice_label {
         (true, Some(v))
     } else {
         match engine_res.pending_watch.as_ref() {
@@ -4945,19 +4952,3 @@ fn blackout_render_system(
     };
 }
 
-fn state_badge_system(engine_res: Res<EngineRes>, mut q: Query<&mut Text, With<StateBadge>>) {
-    if !engine_res.is_changed() {
-        return;
-    }
-    let label = match engine_res.state {
-        DisplayState::Off => "OFF",
-        DisplayState::Kiosk => "KIOSK",
-        DisplayState::Content(_) => "CONTENT",
-        DisplayState::Ambient(_) => "AMBIENT",
-    };
-    if let Ok(mut text) = q.single_mut() {
-        if text.0 != label {
-            text.0 = label.to_string();
-        }
-    }
-}
