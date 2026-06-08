@@ -118,6 +118,7 @@ async fn main() {
         .route("/watch", post(watch_handler))
         .route("/seek", post(seek_handler))
         .route("/game/:name", post(game_handler))
+        .route("/tv-power-toggle", post(tv_power_toggle_handler))
         .route("/transcribe", post(transcribe_handler))
         .route("/audio/sinks", get(audio_sinks_handler))
         .route(
@@ -778,6 +779,38 @@ async fn game_handler(Path(name): Path<String>) -> impl IntoResponse {
             Json(json!({ "error": format!("thread spawn failed: {}", e) })),
         ),
     }
+}
+
+/// POST /tv-power-toggle — global TV-plug toggle endpoint (2026-06-09,
+/// Fredrik's "retire the TV remote" arc). Calls HA's switch.toggle on
+/// the configured `tv_plug_entity`. Toggle (not explicit on/off) so the
+/// same controller-combo flips both directions, no state-tracking on
+/// the caller. SSoT for the TV-plug entity stays in HaConfig.
+///
+/// Called by /usr/local/bin/shannon-global-hotkey (Python evdev daemon)
+/// when the user holds Select+Start on the Xbox controller for >2s.
+/// Could also be called by phone web remote, voice tool, etc. in the
+/// future.
+async fn tv_power_toggle_handler(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    if s.ha.tv_plug_entity.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "tv_plug_entity unconfigured" })),
+        );
+    }
+    let call = HaCall {
+        domain: "switch".to_string(),
+        service: "toggle".to_string(),
+        entity_id: s.ha.tv_plug_entity.clone(),
+    };
+    let status = send(&s.http, &s.ha, &call).await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "call": describe_call(&call),
+            "result": status,
+        })),
+    )
 }
 
 /// POST /transcribe — Phase 5 reactive voice search (2026-05-29).
