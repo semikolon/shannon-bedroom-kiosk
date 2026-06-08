@@ -607,6 +607,30 @@ fn main() -> ExitCode {
     };
 
     eprintln!("[spela-renderer] starting pipeline (HLS={hls_url} audio={audio_device})");
+    // 2026-06-08 fix: explicit PAUSED → wait-for-state-change → PLAYING.
+    // The prior direct-to-PLAYING path caused waylandsink to race
+    // cage's xdg_surface initial-configure event, producing
+    // "A configure is scheduled for an uninitialized xdg_surface"
+    // (wlr_xdg_surface.c:169) and silently aborting. gst-launch
+    // implicitly does PAUSED + wait_for_ASYNC_DONE + PLAYING — the
+    // v4 fallback path works because of that staging. Mirror it here
+    // so waylandsink can complete its Wayland handshake with cage
+    // before the bus starts pushing frames.
+    if let Err(e) = pipeline.set_state(gst::State::Paused) {
+        eprintln!("[spela-renderer] set_state(Paused) failed: {e}");
+        let _ = pipeline.set_state(gst::State::Null);
+        return ExitCode::from(1);
+    }
+    // Wait up to 10s for the pipeline to fully reach PAUSED (waylandsink
+    // surface configured by then). 10s covers cold HLS handshake +
+    // demux + decoder caps negotiation. Timeout/error tears down cleanly.
+    let (state_result, _current, _pending) =
+        pipeline.state(Some(gst::ClockTime::from_seconds(10)));
+    if let Err(e) = state_result {
+        eprintln!("[spela-renderer] PAUSED state change failed/timeout: {e}");
+        let _ = pipeline.set_state(gst::State::Null);
+        return ExitCode::from(1);
+    }
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
         eprintln!("[spela-renderer] set_state(Playing) failed: {e}");
         let _ = pipeline.set_state(gst::State::Null);

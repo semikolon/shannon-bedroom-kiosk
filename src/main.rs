@@ -2219,10 +2219,14 @@ fn setup_ui(mut commands: Commands, fonts: Res<FontHandles>, sidebar_bg: Res<Sid
     // when WatchSubmenu is active and updates tile content from the
     // library snapshot windowed around the cursor.
     //
-    // Layout: x_start=320 (right of sidebar), y_start=180 (under header),
-    // tile=240×360 (3:2 TMDB poster), gutter=30. 5 cols × 2 rows fits
-    // 1620×780 area cleanly.
-    const GRID_X_START: f32 = 320.0;
+    // Layout: x_start = SIDEBAR_WIDTH + 30 (clear the wood-panel sidebar so
+    // column-0 tiles don't render UNDER the menu — was 320 which overlapped
+    // the 540-wide sidebar, surfacing as "Bruby e il segreto d..." text
+    // visible UNDER the WATCH tile in the 2026-06-08 screenshot).
+    // y_start=180 (under header), tile=240×360 (3:2 TMDB poster aspect),
+    // gutter=30. 5 cols × 240 + 4 × 30 gutter = 1320 → fits 1920-570 = 1350
+    // right-pane width with a tiny right margin.
+    const GRID_X_START: f32 = SIDEBAR_WIDTH + 30.0;
     const GRID_Y_START: f32 = 180.0;
     const GRID_TILE_W: f32 = 240.0;
     const GRID_TILE_H: f32 = 360.0;
@@ -4213,19 +4217,33 @@ fn pending_watch_overlay_system(
 fn watch_poster_request_system(
     library_snap: Res<watch_ui::LibrarySnapshotRes>,
     registry: Res<posters::PosterRegistry>,
+    mut last_seen_count: Local<usize>,
 ) {
-    // Only fire when the library snapshot changes (new entries arrived
-    // from the poller). Otherwise every tick would re-request every
-    // poster — wasteful even if `request()` dedupes internally.
-    if !library_snap.is_changed() {
-        return;
-    }
+    // 2026-06-08 fix: the prior `library_snap.is_changed()` gate NEVER
+    // fired in practice. Bevy's change detection only tracks `DerefMut`
+    // access through the `Res<T>` wrapper — but the background library
+    // poller mutates the inner `LibrarySnapshot` through `Arc<Mutex<>>`
+    // interior mutability, which bypasses Bevy entirely. Result: poster
+    // URLs were never sent to the downloader → grid rendered blank
+    // (titles only). Bug surfaced in the 2026-06-08 bedroom-TV photo.
+    //
+    // Fix: track entry-count in a `Local<usize>`. Re-request on count
+    // changes (initial fetch + library additions/removals). Idle ticks
+    // are still no-op (count unchanged → skip without touching the
+    // mutex). `registry.request()` also dedups internally, so even if
+    // count-tracking ever drifts, the downloader's HashMap-contains
+    // check absorbs the redundancy without re-fetching.
     let urls: Vec<String> = match library_snap.0.lock() {
-        Ok(s) => s
-            .entries
-            .iter()
-            .filter_map(|e| e.poster_url.clone())
-            .collect(),
+        Ok(s) => {
+            if s.entries.len() == *last_seen_count {
+                return;
+            }
+            *last_seen_count = s.entries.len();
+            s.entries
+                .iter()
+                .filter_map(|e| e.poster_url.clone())
+                .collect()
+        }
         Err(_) => return,
     };
     for url in urls {
