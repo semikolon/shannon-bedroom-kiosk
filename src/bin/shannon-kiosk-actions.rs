@@ -66,7 +66,19 @@ async fn main() {
     let ha = HaConfig {
         base_url: env_or("HA_BASE_URL", "http://localhost:8123"),
         token: std::env::var("HA_TOKEN").unwrap_or_default(),
-        tv_plug_entity: env_or("HA_TV_PLUG_ENTITY", "switch.bedroom_tv_plug"),
+        // 2026-06-08: default reflects LocalTuya's name-doubling behavior.
+        // The Tuya device's friendly_name is "Bedroom TV Plug" AND its
+        // single DP entity (id=1, the switch) ALSO has per-platform
+        // friendly_name "Bedroom TV Plug" — HA's entity_id generator
+        // concatenates them → switch.bedroom_tv_plug_bedroom_tv_plug.
+        // The default matches current reality so fresh deployments work
+        // without an env override; cleanup path is to rename the entity
+        // in HA UI (Settings → Devices → Bedroom TV Plug → entity ⚙ →
+        // entity ID) to drop the duplication, then update this default.
+        tv_plug_entity: env_or(
+            "HA_TV_PLUG_ENTITY",
+            "switch.bedroom_tv_plug_bedroom_tv_plug",
+        ),
         media_entities: vec![
             ("default".to_string(), music_entity.clone()),
             ("music".to_string(), music_entity),
@@ -726,20 +738,37 @@ async fn game_handler(Path(name): Path<String>) -> impl IntoResponse {
             })),
         );
     }
-    match std::process::Command::new("/usr/local/bin/shannon-games")
-        .arg(&name)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+    // Spawn + REAP in a detached OS thread to prevent zombie
+    // accumulation across multiple game sessions. Without this, each
+    // game launch leaves a defunct shannon-games process parented to
+    // this daemon (init can't reap because the daemon is the parent
+    // until daemon exit). Mirrors the watch_handler pattern.
+    let name_for_thread = name.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("game-spawn-{name}"))
+        .spawn(move || {
+            let mut cmd = std::process::Command::new("/usr/local/bin/shannon-games");
+            cmd.arg(&name_for_thread)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let _ = child.wait();
+                }
+                Err(e) => {
+                    eprintln!("game_handler: failed to spawn shannon-games: {e}");
+                }
+            }
+        });
+    match spawn_result {
         Ok(_) => (
             StatusCode::ACCEPTED,
             Json(json!({ "ok": true, "game": name })),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("spawn failed: {}", e) })),
+            Json(json!({ "error": format!("thread spawn failed: {}", e) })),
         ),
     }
 }
