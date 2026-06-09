@@ -36,6 +36,46 @@ use shannon_kiosk::ha_poll::{
     binary_sensor_from_str, BinarySensorState, HaPollState, MediaPlayerState, PollResult,
 };
 
+/// Fire-and-forget activity event to /var/log.hdd/shannon-activity.log
+/// via the `shannon-activity` shell helper. Best-effort: any failure is
+/// silently ignored. Synchronous-but-fast (spawns + drops the child
+/// handle; the helper itself sync-and-exits in <10 ms typical).
+///
+/// Used to correlate kiosk-actions invocations with shannon-load-temp
+/// samples. The load-temp sampler also self-reads recent activity
+/// counts (`recent_events=N`), so eyeballing one log alone shows
+/// "this load tick overlapped N actions"; the activity log names
+/// them.
+fn log_activity(event: &str, target: &str, details: &str) {
+    // Sanitize whitespace + control chars defensively — shell receives
+    // these as argv (no shell-expansion risk) but a stray newline in
+    // a title would corrupt the activity log line.
+    let clean = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_control() || c == ' ' { '_' } else { c })
+            .collect()
+    };
+    let target = if target.is_empty() {
+        "-".to_string()
+    } else {
+        clean(target)
+    };
+    let details = if details.is_empty() {
+        "-".to_string()
+    } else {
+        clean(details)
+    };
+    let _ = std::process::Command::new("/usr/local/bin/shannon-activity")
+        .args(["kiosk-actions", event, &target, &details])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    // Child is dropped immediately. shannon-activity is single-line
+    // append + sync; it exits cleanly. The shell helper's exit status
+    // is intentionally NOT awaited — that's the fire-and-forget point.
+}
+
 struct AppState {
     engine: Mutex<Engine>,
     ha: HaConfig,
@@ -468,6 +508,7 @@ async fn lights_handler(
                 }
             };
             let entity = call.entity_id.clone();
+            log_activity("lights", &entity, &format!("verb={}", verb));
             // HA group entity_ids are `[a-z0-9_.]+` — all URL-safe per
             // RFC 3986 unreserved set. No encoding needed.
             let daemon_url = format!("http://127.0.0.1:8081/{}?group={}", verb, entity);
@@ -535,6 +576,7 @@ async fn media_handler(
 ) -> impl IntoResponse {
     match plan_media(&entity_key, &action, &s.ha) {
         Ok(call) => {
+            log_activity("media", &call.entity_id, &format!("service={}", call.service));
             let status = send(&s.http, &s.ha, &call).await;
             (
                 StatusCode::OK,
@@ -619,6 +661,21 @@ async fn watch_handler(Json(req): Json<WatchReq>) -> impl IntoResponse {
     let title_owned = title.to_string();
     let smoke_secs = req.smoke;
     let file_index = req.file_index;
+
+    // Emit watch-start NOW (before the spawn). watch-end fires from
+    // inside the wait-thread when spela-local exits. Together they
+    // bracket the playback window for load-temp correlation.
+    {
+        let details = match (&req.magnet, file_index) {
+            (Some(m), Some(i)) if !m.is_empty() => format!("magnet=yes,file_idx={}", i),
+            (Some(m), None) if !m.is_empty() => "magnet=yes".to_string(),
+            (_, Some(i)) => format!("file_idx={}", i),
+            _ => "magnet=no".to_string(),
+        };
+        log_activity("watch-start", &title_owned, &details);
+    }
+    let title_for_log = title_owned.clone();
+    let watch_start_ts = std::time::SystemTime::now();
     // 2026-06-09 — library-bypass: when Darwin signals this is a
     // library-tile-tap (no magnet, title-only), pass `--library` so
     // spela-local skips its `/search` round-trip and goes straight to
@@ -655,9 +712,20 @@ async fn watch_handler(Json(req): Json<WatchReq>) -> impl IntoResponse {
                     // Block this OS thread on the child to reap it
                     // cleanly. axum's tokio runtime is unaffected.
                     let _ = child.wait();
+                    let elapsed = watch_start_ts.elapsed().unwrap_or_default().as_secs();
+                    log_activity(
+                        "watch-end",
+                        &title_for_log,
+                        &format!("elapsed_secs={}", elapsed),
+                    );
                 }
                 Err(e) => {
                     eprintln!("watch_handler: failed to spawn spela-local: {e}");
+                    log_activity(
+                        "watch-spawn-failed",
+                        &title_for_log,
+                        &format!("error={}", e),
+                    );
                 }
             }
         });
@@ -762,6 +830,9 @@ async fn game_handler(Path(name): Path<String>) -> impl IntoResponse {
     // this daemon (init can't reap because the daemon is the parent
     // until daemon exit). Mirrors the watch_handler pattern.
     let name_for_thread = name.clone();
+    let name_for_log = name.clone();
+    log_activity("game-launch", &name_for_log, "via=route");
+    let game_start_ts = std::time::SystemTime::now();
     let spawn_result = std::thread::Builder::new()
         .name(format!("game-spawn-{name}"))
         .spawn(move || {
@@ -773,9 +844,20 @@ async fn game_handler(Path(name): Path<String>) -> impl IntoResponse {
             match cmd.spawn() {
                 Ok(mut child) => {
                     let _ = child.wait();
+                    let elapsed = game_start_ts.elapsed().unwrap_or_default().as_secs();
+                    log_activity(
+                        "game-wrapper-exit",
+                        &name_for_log,
+                        &format!("elapsed_secs={}", elapsed),
+                    );
                 }
                 Err(e) => {
                     eprintln!("game_handler: failed to spawn shannon-games: {e}");
+                    log_activity(
+                        "game-spawn-failed",
+                        &name_for_log,
+                        &format!("error={}", e),
+                    );
                 }
             }
         });
@@ -813,6 +895,7 @@ async fn tv_power_toggle_handler(State(s): State<Arc<AppState>>) -> impl IntoRes
         service: "toggle".to_string(),
         entity_id: s.ha.tv_plug_entity.clone(),
     };
+    log_activity("tv-power-toggle", &call.entity_id, "via=route");
     let status = send(&s.http, &s.ha, &call).await;
     (
         StatusCode::OK,
