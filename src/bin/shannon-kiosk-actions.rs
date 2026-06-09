@@ -619,6 +619,13 @@ async fn watch_handler(Json(req): Json<WatchReq>) -> impl IntoResponse {
     let title_owned = title.to_string();
     let smoke_secs = req.smoke;
     let file_index = req.file_index;
+    // 2026-06-09 — library-bypass: when Darwin signals this is a
+    // library-tile-tap (no magnet, title-only), pass `--library` so
+    // spela-local skips its `/search` round-trip and goes straight to
+    // Darwin's title-only `/play` (Local Bypass + remote-origin path).
+    // Defensive precedence: if magnet IS present, library is ignored
+    // (magnet path is the deterministic-direct-play winner regardless).
+    let library_mode = req.library.unwrap_or(false) && magnet_owned.is_none();
 
     let spawn_result = std::thread::Builder::new()
         .name(format!("watch-spawn-{}", title_owned.replace(' ', "-")))
@@ -633,6 +640,9 @@ async fn watch_handler(Json(req): Json<WatchReq>) -> impl IntoResponse {
             }
             if let Some(idx) = file_index {
                 cmd.arg("--file-index").arg(idx.to_string());
+            }
+            if library_mode {
+                cmd.arg("--library");
             }
             // Detach stdin/stdout/stderr from the daemon's tty so the
             // child can outlive any controlling terminal cleanly. mpv
@@ -1182,6 +1192,18 @@ struct WatchReq {
     magnet: Option<String>,
     #[serde(default)]
     file_index: Option<u32>,
+    // 2026-06-09 — library-bypass signal from Darwin spela's target=shannon
+    // dispatch when no magnet was supplied (kiosk My-Library tile tap or
+    // web-remote My-Library tap). Tells spela-local to skip its own
+    // `/search` round-trip ENTIRELY and POST `/play {title, target:"vlc"}`
+    // straight to Darwin, which routes via Local Bypass + remote-origin
+    // `/library/match` — zero TMDB / zero Torrentio for a play that
+    // should never have left the LAN. Without this signal, spela-local's
+    // legacy title-search branch hits TMDB even for local-library plays
+    // (canonical bug: `Spring` library tap surfaced a `Send Help (2024)`
+    // misrouting through TMDB before the search.rs `fbf56c1` fix).
+    #[serde(default)]
+    library: Option<bool>,
 }
 
 /// Send a planned HA call. Returns a short result tag (never panics; a
